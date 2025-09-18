@@ -1,0 +1,23 @@
+{
+  "python.analysis.typeCheckingMode": "basic",
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.envFile": "${workspaceFolder}/.env",
+  "editor.formatOnPaste": false,
+  "editor.formatOnSave": true,
+  "editor.formatOnType": true,
+  "files.trimTrailingWhitespace": true,
+  "[python]": {
+    "editor.codeActionsOnSave": { "source.organizeImports": "explicit" },
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "ms-python.python"
+  },
+  "python.languageServer": "Pylance",
+  "python.testing.pytestEnabled": true,
+  "[sql]": {
+    "editor.formatOnSave": false,
+    "editor.formatOnType": false,
+    "editor.formatOnPaste": false
+  },
+  "python.analysis.extraPaths": [ "./dashboards/scripts" ],
+  "python.terminal.activateEnvironment": true
+}
