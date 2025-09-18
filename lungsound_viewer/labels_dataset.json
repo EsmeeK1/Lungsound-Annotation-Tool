@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "updated": "2025-09-18T11:42:53",
+  "labels": [
+    "Inademing",
+    "Uitademing",
+    "Piep (Wheeze)",
+    "Knetter (Crackle)",
+    "Rhonchi",
+    "Stridor",
+    "Pleura-wrijving",
+    "Hoest",
+    "Artefact",
+    "Normaal"
+  ],
+  "meta_defaults": {
+    "gender": "",
+    "age": "",
+    "location": ""
+  },
+  "filter_defaults": {
+    "lowcut": 120,
+    "highcut": 1800,
+    "order": 12
+  },
+  "stft_params": {
+    "nperseg": 1024,
+    "hop": 256,
+    "window": "hann"
+  },
+  "dataset_notes": "Pas labels of defaults hier aan; wijzigingen kun je in de app herladen via 'Herlaad labels.json'."
+}

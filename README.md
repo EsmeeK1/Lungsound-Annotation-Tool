@@ -1,2 +1,10 @@
-# Lungsound-Annotation-Tool
-A simple Lung Sound Viewer and Annotation Tool built with PySide6 + PyQtGraph.  Load .wav recordings, explore the waveform, select breathing phases, label them (e.g. wheeze, crackle, asthma, COPD),   and export annotated segments as separate .wav files and CSV metadata.
+# README - Lungsound Annotation Tool
+
+## Credits
+
+The original **Tkinter app** (included in the `experiments` folder of this repository) is derived from the following project:
+[https://github.com/rediet-getnet/ECG-Signal-Viewer-and-Annotation-Tool](https://github.com/rediet-getnet/ECG-Signal-Viewer-and-Annotation-Tool)
+
+Full credit goes to the original author for building this version.
+
+Even though this app isn't made for ECG's but Lungsounds. The blueprint of the app is still derived from that original TKinter app.
