@@ -1,4 +1,7 @@
+PySide6
+pyqtgraph
 numpy
-matplotlib
-PyWavelets
+pandas
+soundfile
 scipy
+sounddevice
