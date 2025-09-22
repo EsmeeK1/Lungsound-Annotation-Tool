@@ -10,8 +10,7 @@
     "Stridor",
     "Pleura-wrijving",
     "Hoest",
-    "Artefact",
-    "Normaal"
+    "Artefact"
   ],
   "meta_defaults": {
     "gender": "",

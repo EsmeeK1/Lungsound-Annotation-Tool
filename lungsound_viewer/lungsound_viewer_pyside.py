@@ -1,5 +1,5 @@
 # lungsound_viewer_pyside.py
-# pip install PySide6 pyqtgraph numpy pandas soundfile scipy sounddevice
+# pip install PySide6 pyqtgraph numpy pandas soundfile
 from __future__ import annotations
 
 import json, sys, os, uuid, datetime
@@ -9,7 +9,6 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import soundfile as sf
-from scipy.signal import stft, butter, filtfilt
 
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
@@ -20,9 +19,6 @@ import pyqtgraph as pg
 EXPECTED_DURATION_S = 30.0
 DEFAULT_SR = 16000
 TIME_SNAP = 0.01
-
-# Default SUK filter (kept constant unless user changes UI controls)
-DEFAULT_FILTER = dict(lowcut=120, highcut=1800, order=12)
 
 LABEL_PALETTE = [
     ("Inademing", (80, 180, 255, 60)),
@@ -37,7 +33,8 @@ LABEL_PALETTE = [
     ("Normaal", (140, 220, 140, 60)),
 ]
 
-pg.setConfigOptions(imageAxisOrder='row-major')
+# Sneller tekenen: geen antialias (lijnen), en laat OpenGL uit (kan wisselend presteren)
+pg.setConfigOptions(imageAxisOrder='row-major', antialias=False, useOpenGL=False)
 
 # -------------------------
 # Data models
@@ -98,11 +95,78 @@ def ensure_dir(path: str):
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
 
-def apply_suk_filter(audio, sr, lowcut=120, highcut=1800, order=12):
-    """Zero-phase Butterworth band-pass as provided by the SUK team."""
-    nyq = 0.5 * sr
-    b, a = butter(order, [lowcut/nyq, highcut/nyq], btype="band")  # type: ignore
-    return filtfilt(b, a, audio)
+# -------------------------
+# Debug helpers
+# -------------------------
+DEBUG_STFT = True                 # zet op False om prints uit te zetten
+DYNAMIC_SPECTRO_LEVELS = False    # True = levels uit percentielen (handig bij debug)
+GRAYSCALE_DEBUG = True            # tijdelijk op True zetten om LUT/levels te omzeilen
+
+def _dbg(msg: str):
+    if DEBUG_STFT:
+        print(msg); sys.stdout.flush()
+
+def _arr_stats(name: str, a: np.ndarray):
+    if not DEBUG_STFT: return
+    a = np.asarray(a)
+    total = a.size
+    finite = np.isfinite(a)
+    n_finite = int(finite.sum())
+    if n_finite == 0:
+        _dbg(f"{name}: shape={a.shape} dtype={a.dtype} NO FINITE VALUES"); return
+    avals = a[finite]
+    p = lambda q: float(np.percentile(avals, q))
+    _dbg(f"{name}: shape={a.shape} dtype={a.dtype} "
+         f"finite={n_finite}/{total} "
+         f"min={avals.min():.3f} max={avals.max():.3f} mean={avals.mean():.3f} "
+         f"p1={p(1):.3f} p50={p(50):.3f} p99={p(99):.3f}")
+
+
+def compute_stft_db(
+    y: np.ndarray,
+    sr: int,
+    nperseg: int = 1024,
+    hop: int = 256,
+    window: str = "hann",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    STFT magnitude in dB, genormaliseerd zodat max == 0 dB (dus overal <= 0).
+    Retourneert f(Hz), t(sec), S_db met shape (F, T).
+    """
+    y = np.asarray(y, dtype=np.float32)
+    N = int(len(y))
+    _dbg(f"[STFT] N={N} sr={sr} nperseg={nperseg} hop={hop}")
+    if N == 0:
+        return (np.zeros(0, np.float32), np.zeros(0, np.float32), np.zeros((0, 0), np.float32))
+
+    win = np.hanning(nperseg).astype(np.float32) if window == "hann" else np.ones(nperseg, np.float32)
+
+    n_frames = 1 + int(np.ceil(max(0, N - nperseg) / float(hop)))
+    total_len = (n_frames - 1) * hop + nperseg
+    if total_len > N:
+            y = np.pad(y, (0, total_len - N), mode="constant")
+
+    shape = (n_frames, nperseg)
+    strides = (y.strides[0] * hop, y.strides[0])
+    frames = np.lib.stride_tricks.as_strided(y, shape=shape, strides=strides)
+    _arr_stats("[STFT] frames (pre-window)", frames[: min(3, len(frames))])
+
+    frames = frames * win[None, :]
+    spec = np.fft.rfft(frames, axis=1)
+    mag  = np.abs(spec).astype(np.float32)
+
+    mmax = float(mag.max()) if mag.size else 1.0
+    _dbg(f"[STFT] mag.max={mmax:.6e}")
+    mag_norm = mag / (mmax + 1e-12)
+    mag_norm = np.minimum(mag_norm, 1.0)          # clamp: voorkomt >0 dB
+
+    S_db = (20.0 * np.log10(np.maximum(mag_norm, 1e-12))).astype(np.float32)
+
+    f = np.fft.rfftfreq(nperseg, d=1.0/float(sr)).astype(np.float32)
+    t = (np.arange(n_frames, dtype=np.float32) * (hop / float(sr)))
+    S_db_FT = S_db.T
+    _arr_stats("[STFT] S_db (F,T)", S_db_FT)
+    return f, t, S_db_FT
 
 # -------------------------
 # Optional audio playback (sounddevice)
@@ -114,7 +178,7 @@ except Exception:
     HAVE_SD = False
 
 class Player(QtCore.QObject):
-    """Small helper for audio playback from a time window."""
+    """Kleine helper voor audioweergave vanaf een tijdvenster."""
     started = QtCore.Signal(float, float)  # emits (t0, t1)
     stopped = QtCore.Signal()
 
@@ -124,7 +188,7 @@ class Player(QtCore.QObject):
         self.playing = False
 
     def play(self, y: np.ndarray, sr: int, t0: float, t1: float):
-        """Play y[t0:t1] once."""
+        """Speel y[t0:t1] eenmalig af."""
         if not HAVE_SD:
             return
         self.stop()
@@ -166,7 +230,7 @@ class Player(QtCore.QObject):
 # Start dialog
 # -------------------------
 class StartDialog(QtWidgets.QDialog):
-    """Start dialog to capture session metadata and pick a root folder."""
+    """Startdialoog om sessiemetadata te kiezen en een root-map te selecteren."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Start – Lung Sound Annotator")
@@ -223,6 +287,68 @@ class StartDialog(QtWidgets.QDialog):
         if loc: meta["location"] = loc
         return meta
 
+class ClickableRegion(pg.LinearRegionItem):
+    """LinearRegionItem dat clicks doorgeeft."""
+    clicked = QtCore.Signal(object)  # emit self
+
+    def __init__(self, *args, seg_id: Optional[str] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seg_id = seg_id
+        self.setMovable(False)
+
+    def mouseClickEvent(self, ev):
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.clicked.emit(self)
+            ev.accept()
+        else:
+            ev.ignore()
+
+class AutoSegmentDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, default_len=1.00, default_overlap=0.00, default_replace=False):
+        super().__init__(parent)
+        self.setWindowTitle("Auto segmenteren")
+        self.setModal(True)
+        v = QtWidgets.QVBoxLayout(self)
+
+        form = QtWidgets.QFormLayout()
+        self.len_s = QtWidgets.QDoubleSpinBox()
+        self.len_s.setDecimals(2); self.len_s.setSingleStep(TIME_SNAP)
+        self.len_s.setRange(TIME_SNAP, 600.0); self.len_s.setValue(default_len)
+
+        self.ovl_s = QtWidgets.QDoubleSpinBox()
+        self.ovl_s.setDecimals(2); self.ovl_s.setSingleStep(TIME_SNAP)
+        self.ovl_s.setRange(0.0, 600.0); self.ovl_s.setValue(default_overlap)
+
+        self.chk_replace = QtWidgets.QCheckBox("Vervang bestaande segmenten")
+        self.chk_replace.setChecked(default_replace)
+
+        form.addRow("Segmentlengte (s):", self.len_s)
+        form.addRow("Overlap tussen segmenten (s):", self.ovl_s)
+        v.addLayout(form)
+        v.addWidget(self.chk_replace)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel | QtWidgets.QDialogButtonBox.StandardButton.Ok
+        )
+        v.addWidget(btns)
+        btns.rejected.connect(self.reject)
+        btns.accepted.connect(self.on_accept)
+
+        self._ok = False
+
+    def on_accept(self):
+        L = float(self.len_s.value())
+        O = float(self.ovl_s.value())
+        if L <= 0 or O < 0 or O >= L:
+            QtWidgets.QMessageBox.warning(self, "Ongeldige parameters",
+                "Zorg dat: lengte > 0 en 0 ≤ overlap < lengte.")
+            return
+        self._ok = True
+        self.accept()
+
+    def values(self):
+        return float(self.len_s.value()), float(self.ovl_s.value()), bool(self.chk_replace.isChecked())
+
 # -------------------------
 # Main window
 # -------------------------
@@ -230,12 +356,12 @@ class App(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Lung Sound Viewer (PySide6 + PyQtGraph)")
-        self.resize(1500, 950)
+        self.resize(1200, 820)
 
-        # Menu: reopen a new folder (re-shows start dialog)
+        # --- Menu ---
         m = self.menuBar().addMenu("Bestand")
-        act_open = m.addAction("Map openen…")
-        act_open.triggered.connect(self.open_folder_dialog)
+        self.act_open = m.addAction("Map openen…")
+        self.act_open.triggered.connect(self.open_folder_dialog)
 
         # Runtime state
         self.player = Player()
@@ -243,11 +369,7 @@ class App(QtWidgets.QMainWindow):
         self.files: List[str] = []
         self.idx = -1
 
-        self.y_raw: Optional[np.ndarray] = None   # always keep the raw signal
-        self.y_filt: Optional[np.ndarray] = None  # cached filtered signal
-        self.use_filter = False
-        self.filter_params = DEFAULT_FILTER.copy()
-
+        self.y_raw: Optional[np.ndarray] = None
         self.sr = DEFAULT_SR
         self.t: Optional[np.ndarray] = None
         self.state: Optional[FileState] = None
@@ -258,79 +380,110 @@ class App(QtWidgets.QMainWindow):
         cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
         H = QtWidgets.QHBoxLayout(cw)
 
-        # ----- Left: plots -----
+        # ----- Links: waveform -----
         left = QtWidgets.QWidget(); H.addWidget(left, 3)
         gl = QtWidgets.QGridLayout(left)
 
-        # Waveform (filled) – NOT pink; playhead line is red.
+        # PlotWidget
         self.p_wave = pg.PlotWidget()
-        self.p_wave.setLabel("bottom", "Time (s)")
+        self.p_wave.setLabel("bottom", "Tijd (s)")
         self.p_wave.setLabel("left", "Amplitude")
         self.p_wave.showGrid(x=True, y=True, alpha=0.2)
+
+        # Playhead en selectie (eerst aanmaken)
         self.playhead = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#CC3333', width=1))
-        self.region = pg.LinearRegionItem([2.0, 3.0], brush=(100,180,255,60), movable=True)
-        self.p_wave.addItem(self.playhead); self.p_wave.addItem(self.region)
+        self.region   = pg.LinearRegionItem([0.0, 2.5], brush=(100,180,255,60), movable=True)
+
+        # Sneller tekenen: één cached PlotDataItem met downsampling
+        # Let op: sommige pyqtgraph-versies accepteren de keyword-args direct;
+        # anders kun je de setDownsampling(...) methode gebruiken (zie try/except hieronder).
+        self.curve = pg.PlotDataItem(
+            pen=pg.mkPen('#1976D2', width=1.2),
+            clipToView=True,
+            autoDownsample=True,
+            downsampleMethod='peak',
+        )
+
+        # Items in de juiste volgorde toevoegen (elk slechts één keer!)
+        self.p_wave.addItem(self.curve)
+        self.p_wave.addItem(self.playhead)
+        self.p_wave.addItem(self.region)
+
         gl.addWidget(self.p_wave, 0, 0)
 
-        # Time slider + time label (free playback position)
+        # (Compat-laagje voor oudere pyqtgraph-versies)
+        try:
+            # Als de kwargs niet bestaan in jouw versie, forceer via methodes:
+            self.curve.setDownsampling(auto=True, method='peak')
+        except Exception:
+            pass
+
+        # Tijdslider + label
         self.time_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.time_slider.setRange(0, int(EXPECTED_DURATION_S*100))
         self.lbl_time = QtWidgets.QLabel("0.00 s")
         tbar = QtWidgets.QHBoxLayout()
         tbar.addWidget(QtWidgets.QLabel("Tijd:")); tbar.addWidget(self.time_slider, 1); tbar.addWidget(self.lbl_time)
         gl.addLayout(tbar, 1, 0)
+        self.init_spectrogram(gl)
 
-        # Spectrogram (interactive via x-link with waveform)
-        self.p_spec = pg.PlotWidget()
-        self.p_spec.setLabel("bottom", "Time (s)")
-        self.p_spec.setLabel("left", "Frequency (Hz)")
-        self.p_spec.setMouseEnabled(x=True, y=True)     # interactive
-        self.p_spec.setXLink(self.p_wave)               # link x-axes
-        self.img_spec = pg.ImageItem(axisOrder='row-major')
-        self.p_spec.addItem(self.img_spec)
-        gl.addWidget(self.p_spec, 2, 0)
-
-        # Colorbar (if available in your pyqtgraph version)
-        self.colorbar = None
-        try:
-            self.colorbar = pg.ColorBarItem(values=(-100, 0), colorMap=pg.colormap.get('inferno'))
-            self.colorbar.setImageItem(self.img_spec, insertIn=self.p_spec.getPlotItem())
-        except Exception:
-            pass  # older pyqtgraph: skip
-
-        # ----- Right panel -----
+        # ----- Rechts: panel -----
         right = QtWidgets.QWidget(); H.addWidget(right, 1)
         rv = QtWidgets.QVBoxLayout(right)
 
         self.lbl_path = QtWidgets.QLabel("—"); self.lbl_path.setStyleSheet("font-weight:600;")
         rv.addWidget(self.lbl_path)
+
+        self.btn_open_folder = QtWidgets.QPushButton("Open folder…")
+        rv.addWidget(self.btn_open_folder)
+
         nav = QtWidgets.QHBoxLayout(); self.btn_prev = QtWidgets.QPushButton("◀ Prev"); self.btn_next = QtWidgets.QPushButton("Next ▶")
         nav.addWidget(self.btn_prev); nav.addWidget(self.btn_next); rv.addLayout(nav)
 
-        self.lbl_sel = QtWidgets.QLabel("Selected: –"); rv.addWidget(self.lbl_sel)
+        # "Selected:" met invoervelden die gekoppeld zijn aan de sleep-regio
+        sel_row = QtWidgets.QHBoxLayout()
+        sel_row.addWidget(QtWidgets.QLabel("Selected:"))
+        self.sel_start = QtWidgets.QDoubleSpinBox()
+        self.sel_start.setDecimals(2); self.sel_start.setSingleStep(TIME_SNAP); self.sel_start.setRange(0, 1e6)
+        self.sel_end   = QtWidgets.QDoubleSpinBox()
+        self.sel_end.setDecimals(2); self.sel_end.setSingleStep(TIME_SNAP); self.sel_end.setRange(0, 1e6)
+        self.lbl_sel_delta = QtWidgets.QLabel("(Δ 0.00 s)")
+        sel_row.addWidget(self.sel_start); sel_row.addWidget(QtWidgets.QLabel("–")); sel_row.addWidget(self.sel_end)
+        sel_row.addWidget(self.lbl_sel_delta)
+        rv.addLayout(sel_row)
 
-        # Filter controls
-        grp_f = QtWidgets.QGroupBox("SUK-filter")
-        f_l = QtWidgets.QFormLayout(grp_f)
-        self.chk_filter = QtWidgets.QCheckBox("Filter aan/uit")
-        self.spin_low = QtWidgets.QSpinBox(); self.spin_low.setRange(10, 5000); self.spin_low.setValue(DEFAULT_FILTER["lowcut"])
-        self.spin_high = QtWidgets.QSpinBox(); self.spin_high.setRange(100, 8000); self.spin_high.setValue(DEFAULT_FILTER["highcut"])
-        self.spin_order = QtWidgets.QSpinBox(); self.spin_order.setRange(2, 20); self.spin_order.setValue(DEFAULT_FILTER["order"])
-        self.btn_apply_filter = QtWidgets.QPushButton("Toepassen")
-        f_l.addRow(self.chk_filter); f_l.addRow("Lowcut (Hz):", self.spin_low); f_l.addRow("Highcut (Hz):", self.spin_high); f_l.addRow("Orde:", self.spin_order); f_l.addRow(self.btn_apply_filter)
-        rv.addWidget(grp_f)
+        # sync: typen → regio
+        self.sel_start.valueChanged.connect(lambda _: self.on_sel_spin_changed())
+        self.sel_end.valueChanged.connect(lambda _: self.on_sel_spin_changed())
 
-        # Labels management
-        box = QtWidgets.QGroupBox("Labels"); vb = QtWidgets.QVBoxLayout(box)
-        self.combo_labels = QtWidgets.QComboBox(); self.combo_labels.addItems([name for name,_ in LABEL_PALETTE])
-        self.btn_reload_labels = QtWidgets.QPushButton("Herlaad labels.json")
-        vb.addWidget(self.combo_labels); vb.addWidget(self.btn_reload_labels)
-        hb = QtWidgets.QHBoxLayout(); self.txt_new_label = QtWidgets.QLineEdit(); self.txt_new_label.setPlaceholderText("Nieuw label…")
+        # Labels beheer
+        box = QtWidgets.QGroupBox("Labels")
+        vb = QtWidgets.QVBoxLayout(box)
+
+        self.combo_labels = QtWidgets.QComboBox()
+        self.combo_labels.addItems([name for name, _ in LABEL_PALETTE])
+
+        hb = QtWidgets.QHBoxLayout()
+        self.txt_new_label = QtWidgets.QLineEdit()
+        self.txt_new_label.setPlaceholderText("Nieuw label…")
         self.btn_add_label = QtWidgets.QPushButton("Voeg label toe aan selectie")
-        hb.addWidget(self.txt_new_label); vb.addLayout(hb); vb.addWidget(self.btn_add_label)
+        self.btn_reload_labels = QtWidgets.QPushButton("Herlaad labels.json")
+
+        # Eerst aanmaken, dán toevoegen
+        vb.addWidget(self.combo_labels)
+        hb.addWidget(self.txt_new_label)
+        vb.addLayout(hb)
+        vb.addWidget(self.btn_add_label)
+        vb.addWidget(self.btn_reload_labels)
+
         rv.addWidget(box)
 
-        # Segments list + editor (remove via selection)
+        # Auto-segmenteren
+        self.btn_auto_seg = QtWidgets.QPushButton("Auto segment…")
+        rv.addWidget(self.btn_auto_seg)
+        self.btn_auto_seg.clicked.connect(self.auto_segment_dialog)
+
+        # Segmentlijst + editor
         rv.addWidget(QtWidgets.QLabel("Segments"))
         self.list = QtWidgets.QListWidget(); rv.addWidget(self.list, 1)
         edit = QtWidgets.QGroupBox("Segment bewerken"); fe = QtWidgets.QFormLayout(edit)
@@ -351,9 +504,23 @@ class App(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("P"), self, lambda: self.advance(-1))
         QtGui.QShortcut(QtGui.QKeySequence("Delete"), self, self.delete_selected)
 
+        # Arrow-key nudges voor selectie-regio (0.01 s per stap)
+        for seq, cb in [
+            ("Left",        lambda: self.nudge_region(-TIME_SNAP, "move")),
+            ("Right",       lambda: self.nudge_region(+TIME_SNAP, "move")),
+            ("Shift+Left",  lambda: self.nudge_region(-TIME_SNAP, "start")),
+            ("Shift+Right", lambda: self.nudge_region(+TIME_SNAP, "start")),
+            ("Ctrl+Left",   lambda: self.nudge_region(-TIME_SNAP, "end")),
+            ("Ctrl+Right",  lambda: self.nudge_region(+TIME_SNAP, "end")),
+        ]:
+            sc = QtGui.QShortcut(QtGui.QKeySequence(seq), self)
+            sc.setContext(QtCore.Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(cb)
+
         # Signals
         self.btn_prev.clicked.connect(lambda: self.advance(-1))
         self.btn_next.clicked.connect(lambda: self.advance(+1))
+        self.btn_open_folder.clicked.connect(self.open_folder_dialog)
         self.btn_add_label.clicked.connect(self.add_label_to_selection)
         self.txt_new_label.returnPressed.connect(self.add_label_to_selection)
         self.btn_remove_label.clicked.connect(self.remove_selected_label)
@@ -362,28 +529,87 @@ class App(QtWidgets.QMainWindow):
         self.btn_update.clicked.connect(self.update_segment)
         self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_export_csv.clicked.connect(self.export_csv)
-
-        self.chk_filter.toggled.connect(self.on_filter_toggle)
-        self.btn_apply_filter.clicked.connect(self.on_apply_filter)
         self.time_slider.valueChanged.connect(self.on_slider_changed)
         self.btn_reload_labels.clicked.connect(self.reload_labels_json)
 
         self.player.started.connect(self.on_play_started)
         self.player.stopped.connect(self.on_play_stopped)
 
-        # Timer to animate playhead during playback
+        # Timer voor playhead-animatie
         self.timer = QtCore.QTimer(self); self.timer.setInterval(30); self.timer.timeout.connect(self.tick_playhead)
 
-        # Session meta stored from start dialog
+        # Sessie-meta uit startdialoog
         self.session_meta: Dict[str, object] = {}
         self.play_window: Tuple[float, float] = (0.0, 0.0)
 
-        # Kick off
+        # Start
         self.open_folder_dialog(first=True)
+
+    # --------- Auto-segmenteren ----------
+    def auto_segment_dialog(self):
+        if self.t is None or len(self.t) == 0:
+            QtWidgets.QMessageBox.information(self, "Auto segmenteren", "Geen audio geladen.")
+            return
+        dlg = AutoSegmentDialog(self, default_len=1.00, default_overlap=0.00, default_replace=False)
+        if not dlg.exec():
+            return
+        seg_len, seg_ovl, replace = dlg.values()
+        self.apply_auto_segments(seg_len, seg_ovl, replace)
+
+    def apply_auto_segments(self, seg_len: float, seg_ovl: float, replace: bool):
+        """
+        Maak segmenten van seg_len met 'seg_ovl' seconden overlap tussen opeenvolgende segmenten.
+        Stap tussen starts = seg_len - seg_ovl. Laatste segment mag korter zijn.
+        We rekenen in ticks van TIME_SNAP om afrondingsfouten te voorkomen.
+        """
+        if self.state is None or self.t is None or len(self.t) == 0:
+            return
+
+        dur = float(self.t[-1])
+        snap = float(TIME_SNAP)
+
+        # Ticks (0.01 s per tick): vermijdt drijvende-kommadrift
+        len_ticks = max(1, int(round(seg_len / snap)))
+        ovl_ticks = max(0, int(round(seg_ovl / snap)))
+
+        # Overlap moet strikt kleiner zijn dan lengte
+        if ovl_ticks >= len_ticks:
+            QtWidgets.QMessageBox.warning(
+                self, "Ongeldige parameters",
+                "Zorg dat: 0 ≤ overlap < lengte."
+            )
+            return
+
+        stride_ticks = len_ticks - ovl_ticks                # stap tussen starts
+        total_ticks  = int(round(dur / snap))
+
+        new_segments: List[Segment] = []
+        start_tick = 0
+        while start_tick < total_ticks:
+            end_tick = min(start_tick + len_ticks, total_ticks)  # laatste korter is oké
+            a = round(start_tick * snap, 2)                      # netjes afronden op 2 decimalen
+            b = round(end_tick   * snap, 2)
+            new_segments.append(Segment(id=str(uuid.uuid4()), t_start=a, t_end=b, labels=[]))
+            start_tick += stride_ticks
+
+        if replace:
+            self.state.segments = new_segments
+        else:
+            self.state.segments.extend(new_segments)
+
+        self.refresh_segment_list()
+        self.save_json()
+
+        # selecteer eerste nieuw gemaakte segment
+        if self.state.segments:
+            idx = len(self.state.segments) - len(new_segments)
+            self.list.setCurrentRow(max(0, idx))
 
     # --------- Folder flow ----------
     def open_folder_dialog(self, first=False):
-        """Show the start dialog and (re)build the file queue."""
+        """Toon startdialoog en (opnieuw) bouw de filequeue."""
+        self.player.stop()
+
         dlg = StartDialog(self)
         if not dlg.exec():
             if first: sys.exit(0)
@@ -400,7 +626,7 @@ class App(QtWidgets.QMainWindow):
         self.load_current()
 
     def build_file_queue(self, root: str):
-        """Collect .wav files: top-level first, then subfolders."""
+        """Verzamel .wav-bestanden: eerst top-level, daarna submappen."""
         files = []
         for name in sorted(os.listdir(root)):
             p = os.path.join(root, name)
@@ -416,22 +642,21 @@ class App(QtWidgets.QMainWindow):
 
     # --------- Load & render ----------
     def load_current(self):
-        """Load current file, render waveform and spectrogram, reset UI."""
+        """Laad huidig bestand, render waveform en reset UI."""
         f = self.files[self.idx]
         self.lbl_path.setText(f"{human_relpath(self.root, os.path.dirname(f))}/{os.path.basename(f)}")
 
         y, sr = sf.read(f, dtype="float32", always_2d=False)
         if y.ndim == 2: y = y.mean(axis=1)
         self.y_raw = y.astype(np.float32)
-        self.y_filt = None
         self.sr = int(sr)
-        self.t = np.arange(len(self.y_raw), dtype=float) / self.sr
+        self.t = np.arange(len(self.y_raw), dtype=float) / self.sr # type: ignore
 
-        dur = len(self.y_raw)/self.sr
+        dur = len(self.y_raw)/self.sr # type: ignore
         self.time_slider.blockSignals(True); self.time_slider.setRange(0, int(dur*100)); self.time_slider.setValue(0); self.time_slider.blockSignals(False)
         self.lbl_time.setText("0.00 s"); self.playhead.setPos(0.0)
 
-        # Load or create sidecar JSON
+        # Sidecar JSON laden of aanmaken
         js_path = json_sidecar_path(f)
         if os.path.isfile(js_path):
             with open(js_path, "r", encoding="utf-8") as fh:
@@ -439,95 +664,235 @@ class App(QtWidgets.QMainWindow):
         else:
             self.state = FileState(file=os.path.basename(f), sr=self.sr, meta=dict(self.session_meta), segments=[])
 
-        # Render
+        # Render waveform
         self.draw_waveform()
-        self.draw_spectrogram()
+        self.update_spectrogram()
 
-        # Selection defaults
-        self.region.blockSignals(True); self.region.setRegion([2.0, 3.0]); self.region.blockSignals(False)
-        self.lbl_sel.setText("Selected: 2.00–3.00 s (Δ 1.00 s)")
+        # Default selectie
+        self._blocking = True
+        self.region.setRegion((2.0, 3.0))
+        self.sel_start.setValue(2.0)
+        self.sel_end.setValue(3.0)
+        self.lbl_sel_delta.setText("(Δ 1.00 s)")
+        self._blocking = False
 
         self.refresh_segment_list()
         self.save_json()
 
-    # --------- Signal selection ----------
+    # --------- Segmentlijst & overlays ----------
+    def on_overlay_clicked(self, reg: ClickableRegion):
+        # Zoek de segment-index bij deze overlay en selecteer die rij
+        if self.state is None:
+            return
+        try_id = getattr(reg, "seg_id", None)
+        if try_id is None:
+            return
+        for i, s in enumerate(self.state.segments):
+            if s.id == try_id:
+                self.list.setCurrentRow(i)
+                # ook de selectie-regio (boven) gelijk zetten
+                self._blocking = True
+                self.region.setRegion((s.t_start, s.t_end))
+                self.sel_start.setValue(s.t_start)
+                self.sel_end.setValue(s.t_end)
+                self.lbl_sel_delta.setText(f"(Δ {(s.t_end - s.t_start):.2f} s)")
+                self._blocking = False
+                break
+
+    # --------- Signaalkeuze ----------
     def current_signal(self) -> np.ndarray:
-        """Return raw or SUK-filtered signal depending on toggle; cache filtered output."""
-        if not getattr(self, "use_filter", False):
-            return self.y_raw
-        if getattr(self, "y_filt", None) is None:
-            p = getattr(self, "filter_params", {"lowcut": 120, "highcut": 1800, "order": 12})
-            y = np.nan_to_num(self.y_raw, nan=0.0, posinf=0.0, neginf=0.0)
-            self.y_filt = np.nan_to_num(apply_suk_filter(y, self.sr, **p)).astype(np.float32)
-        return self.y_filt
+        """Altijd het ruwe signaal (filter is verwijderd)."""
+        return self.y_raw # type: ignore
 
-
-    # --------- Drawing ----------
+    # --------- Tekenen ----------
     def draw_waveform(self):
         y = self.current_signal()
         x = self.t
-        self.p_wave.clear()
-        self.p_wave.setLabel("bottom", "Time (s)")
+        if y is None or x is None:
+            return
+
+        # Hergebruik dezelfde curve; geen fill onder de curve (scheelt veel)
+        self.curve.setData(x=x, y=y, connect='finite')
+
+        # Aslabels & grid (éénmalig zetten is voldoende, maar dit is goedkoop)
+        self.p_wave.setLabel("bottom", "Tijd (s)")
         self.p_wave.setLabel("left", "Amplitude")
         self.p_wave.showGrid(x=True, y=True, alpha=0.2)
 
-        curve = pg.PlotCurveItem(
-            x, y,
-            pen=pg.mkPen(120, width=1),
-            fillLevel=0.0,
-            brush=pg.mkBrush(100, 180, 255, 60),
-        )
-        self.p_wave.addItem(curve)
-        self.p_wave.addItem(self.playhead)
-        self.p_wave.addItem(self.region)
-        for reg in getattr(self, "overlay_regions", {}).values():
-            self.p_wave.addItem(reg)
+        # Houd de x-limieten stabiel zodat er geen auto-range kost plaatsvindt
+        if len(x) > 1:
+            xmax = float(x[-1])
+            self.p_wave.setLimits(xMin=0.0, xMax=xmax)
+            # Laat de volledige opname zien bij laden
+            vb = self.p_wave.getViewBox()
+            vb.setXRange(0.0, xmax, padding=0.02)
 
-    def draw_spectrogram(self):
+        # Zorg dat playhead/region aanwezig blijven
+        # (ze zijn al toegevoegd in __init__, dus niets te doen)
+        # Overlays opnieuw toevoegen als je die gebruikt:
+        for reg in getattr(self, "overlay_regions", {}).values():
+            if reg.scene() is None:  # nog niet toegevoegd
+                self.p_wave.addItem(reg)
+
+    # --------- Spectrogram ----------
+    def init_spectrogram(self, grid_layout: QtWidgets.QGridLayout):
+        """Create the spectrogram plot below the waveform."""
+        self.p_spec = pg.PlotWidget()
+        self.p_spec.setBackground('k')   # belangrijk: expliciet zwarte achtergrond
+        self.p_spec.setLabel("bottom", "Tijd (s)")
+        self.p_spec.setLabel("left", "Frequentie (Hz)")
+        self.p_spec.setMouseEnabled(x=True, y=True)   # mag interactief zijn
+        self.p_spec.setXLink(self.p_wave)             # koppel X-zoom/pan met waveform
+
+        # init_spectrogram(...)
+        self.img_spec = pg.ImageItem(axisOrder='row-major')
+        self.p_spec.addItem(self.img_spec)
+
+        self.colorbar = None
+        if not GRAYSCALE_DEBUG:
+            try:
+                cmap = pg.colormap.get('inferno')
+                self.colorbar = pg.ColorBarItem(values=(-100, 0), colorMap=cmap)
+                # sommige versies hebben geen insertIn:
+                try:
+                    self.colorbar.setImageItem(self.img_spec, insertIn=self.p_spec.getPlotItem()) # type: ignore
+                except TypeError:
+                    self.colorbar.setImageItem(self.img_spec)
+            except Exception:
+                pass
+
+        # Onder de tijdslider plaatsen (rij 2, kolom 0)
+        grid_layout.addWidget(self.p_spec, 2, 0)
+
+    def update_spectrogram(self):
+        """Compute STFT en teken als image."""
         y = self.current_signal()
         if y is None or len(y) == 0:
-            return
+            _dbg("[STFT] geen data"); return
 
-        # STFT: nperseg=1024, hop=256, padding tot eind zodat de tijd-as doorloopt
-        f, t, Z = stft(
-            y, fs=self.sr,
-            window="hann",
-            nperseg=1024,
-            noverlap=1024-256,
-            boundary="zeros",
-            padded=True,
-        )
-        S = 20 * np.log10(np.maximum(1e-10, np.abs(Z)))
-        img = S[::-1, :]  # 0 Hz onderaan
+        f, t, S_db = compute_stft_db(y, self.sr, nperseg=1024, hop=256, window="hann")
+        if S_db.size == 0:
+            _dbg("[STFT] lege spectrogram array"); return
 
-        # Kleur & levels
-        lut = pg.colormap.get("inferno").getLookupTable(256)
-        self.img_spec.setLookupTable(lut)
-        self.img_spec.setLevels((-100, 0))
-        self.img_spec.setImage(img, autoLevels=False)  # niet laten autoscalen
+        _arr_stats("[UI] S_db (voor beeld)", S_db)
 
-        # Pixels -> (tijd, frequentie)
+        # 0 Hz onderaan: flip langs frequentie-as
+        img = S_db[::-1, :]   # shape (F, T)
+
+        if GRAYSCALE_DEBUG:
+            # Schaal naar 8-bit grijs zodat LUT/levels niet meespelen
+            finite = np.isfinite(img)
+            if finite.any():
+                vmin = float(np.percentile(img[finite], 5))
+                vmax = float(np.percentile(img[finite], 99))
+                if vmin >= vmax:
+                    vmin, vmax = -100.0, 0.0
+            else:
+                vmin, vmax = -100.0, 0.0
+            im8 = (255.0 * np.clip((img - vmin) / (vmax - vmin + 1e-12), 0.0, 1.0)).astype(np.uint8)
+            _arr_stats("[UI] im8", im8)
+            self.img_spec.setLookupTable(None)   # gebruik default grijs
+            self.img_spec.setLevels((0, 255))
+            self.img_spec.setImage(im8, autoLevels=False)
+        else:
+            # Kleur: inferno + vaste of dynamische levels
+            try:
+                lut = pg.colormap.get("inferno").getLookupTable(256) # type: ignore
+                self.img_spec.setLookupTable(lut)
+            except Exception:
+                self.img_spec.setLookupTable(None)
+            if DYNAMIC_SPECTRO_LEVELS:
+                finite = np.isfinite(img)
+                if finite.any():
+                    vmin = float(np.percentile(img[finite], 5))
+                    vmax = float(np.percentile(img[finite], 99))
+                    if vmin >= vmax:
+                        vmin, vmax = -100.0, 0.0
+                else:
+                    vmin, vmax = -100.0, 0.0
+                self.img_spec.setLevels((vmin, vmax))
+                _dbg(f"[UI] levels dynamic: vmin={vmin:.2f} vmax={vmax:.2f}")
+            else:
+                self.img_spec.setLevels((-100.0, 0.0))
+            self.img_spec.setImage(img, autoLevels=False)
+
+        # Geometrie & assen
         if len(t) > 1 and len(f) > 1:
-            self.img_spec.setRect(QtCore.QRectF(0, 0, float(t[-1]), float(f[-1])))
-            self.p_spec.setLimits(xMin=0, xMax=float(t[-1]), yMin=0, yMax=float(f[-1]))
-            self.p_spec.setXRange(0, float(t[-1]))
-            self.p_spec.setYRange(0, float(f[-1]))
+            t_max = float(t[-1]); f_max = float(f[-1])
+            self.img_spec.setRect(QtCore.QRectF(0.0, 0.0, t_max, f_max))
+            self.p_spec.setLimits(xMin=0.0, xMax=t_max, yMin=0.0, yMax=f_max)
+            self.p_spec.setXRange(0.0, t_max)
+            self.p_spec.setYRange(0.0, f_max)
+            _dbg(f"[UI] rect set: t_max={t_max:.3f}s f_max={f_max:.1f}Hz img.shape={img.shape}")
 
     # --------- Interactions ----------
     def on_region_changed(self):
         if self._blocking: return
         a, b = self.region.getRegion()
-        a = max(0.0, snap_t(a)); b = max(a + TIME_SNAP, snap_t(b))
-        self._blocking = True; self.region.setRegion((a,b)); self._blocking = False
-        self.lbl_sel.setText(f"Selected: {a:.2f}–{b:.2f} s (Δ {(b-a):.2f} s)")
+        a = max(0.0, snap_t(a)); b = max(a + TIME_SNAP, snap_t(b)) # type: ignore
+        self._blocking = True
+        self.region.setRegion((a, b))
+        self.sel_start.setValue(a)
+        self.sel_end.setValue(b)
+        self.lbl_sel_delta.setText(f"(Δ {(b - a):.2f} s)")
+        self._blocking = False
 
     def on_slider_changed(self, val: int):
-        """Slider is the free playback position; does not follow the selection."""
+        """Slider is vrije afspeelpositie; volgt de selectie niet."""
         t = val/100.0
         self.playhead.setPos(t)
         self.lbl_time.setText(f"{t:.2f} s")
 
-    # --------- Playback (free: from slider to end) ----------
+    def on_sel_spin_changed(self):
+        if self._blocking: return
+        a = float(self.sel_start.value())
+        b = float(self.sel_end.value())
+        a = max(0.0, snap_t(a))
+        b = max(a + TIME_SNAP, snap_t(b))
+        self._blocking = True
+        self.sel_start.setValue(a)
+        self.sel_end.setValue(b)
+        self.region.setRegion((a, b))
+        self.lbl_sel_delta.setText(f"(Δ {(b - a):.2f} s)")
+        self._blocking = False
+
+    def nudge_region(self, dt: float, mode: str = "move"):
+        """
+        Verplaats of resize de selectie-regio in stapjes van dt seconden.
+        mode: "move" | "start" | "end"
+        """
+        if self.t is None or len(self.t) == 0:
+            return
+        dur = float(self.t[-1])
+        a, b = self.region.getRegion()
+        a = float(a); b = float(b) # type: ignore
+        step = float(dt)
+
+        if mode == "move":
+            width = b - a
+            new_a = max(0.0, min(a + step, dur - width))
+            new_b = new_a + width
+        elif mode == "start":
+            new_a = max(0.0, min(a + step, b - TIME_SNAP))
+            new_b = b
+        elif mode == "end":
+            new_a = a
+            new_b = min(dur, max(b + step, a + TIME_SNAP))
+        else:
+            return
+
+        new_a = snap_t(new_a); new_b = snap_t(new_b)
+        if new_b <= new_a:
+            new_b = min(dur, new_a + TIME_SNAP)
+
+        self._blocking = True
+        self.region.setRegion((new_a, new_b))
+        self.sel_start.setValue(new_a)
+        self.sel_end.setValue(new_b)
+        self.lbl_sel_delta.setText(f"(Δ {(new_b - new_a):.2f} s)")
+        self._blocking = False
+
+    # --------- Playback (vrij: van slider tot einde) ----------
     def toggle_play(self):
         if not HAVE_SD or self.y_raw is None:
             QtWidgets.QMessageBox.information(self, "Playback", "Playback niet beschikbaar.")
@@ -569,16 +934,19 @@ class App(QtWidgets.QMainWindow):
     def refresh_segment_list(self):
         self.list.clear()
         if not self.state: return
-        # remove old overlays
+        # oude overlays verwijderen
         for reg in self.overlay_regions.values():
             try: self.p_wave.removeItem(reg)
             except Exception: pass
         self.overlay_regions.clear()
-        # repopulate
+        # opnieuw vullen
         for s in self.state.segments:
             self.list.addItem(f"{s.t_start:.2f}-{s.t_end:.2f}s | {'; '.join(s.labels) or '(geen labels)'}")
-            reg = pg.LinearRegionItem([s.t_start, s.t_end], brush=self._brush_for_labels(s.labels), movable=False)
+            reg = ClickableRegion([s.t_start, s.t_end],
+                                brush=self._brush_for_labels(s.labels),
+                                seg_id=s.id)
             self.p_wave.addItem(reg)
+            reg.clicked.connect(self.on_overlay_clicked)
             self.overlay_regions[s.id] = reg
 
     def _find_segment_by_bounds(self, a: float, b: float) -> Optional[Segment]:
@@ -601,7 +969,7 @@ class App(QtWidgets.QMainWindow):
             label = self.combo_labels.currentText()
 
         a, b = self.region.getRegion()
-        a = snap_t(a); b = max(a+TIME_SNAP, snap_t(b))
+        a = snap_t(a); b = max(a+TIME_SNAP, snap_t(b)) # type: ignore
 
         seg = self._find_segment_by_bounds(a, b)
         if seg is None:
@@ -623,7 +991,12 @@ class App(QtWidgets.QMainWindow):
         self.list_labels.clear()
         for L in s.labels:
             self.list_labels.addItem(L)
-        self._blocking = True; self.region.setRegion((s.t_start, s.t_end)); self._blocking = False
+        self._blocking = True
+        self.region.setRegion((s.t_start, s.t_end))
+        self.sel_start.setValue(s.t_start)
+        self.sel_end.setValue(s.t_end)
+        self.lbl_sel_delta.setText(f"(Δ {(s.t_end - s.t_start):.2f} s)")
+        self._blocking = False
 
     def remove_selected_label(self):
         row = self.list.currentRow()
@@ -652,7 +1025,7 @@ class App(QtWidgets.QMainWindow):
         row = self.list.currentRow()
         if not self.state or row < 0: return
         ans = QtWidgets.QMessageBox.question(self, "Delete segment", "Verwijder geselecteerd segment?")
-        if ans != QtWidgets.QMessageBox.Yes: return
+        if ans != QtWidgets.QMessageBox.Yes: return # type: ignore
         del self.state.segments[row]
         self.refresh_segment_list()
         self.save_json()
@@ -686,27 +1059,8 @@ class App(QtWidgets.QMainWindow):
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export CSV", csv_path_for_root(self.root), "CSV (*.csv)")
         if not path: return
-        pd.DataFrame(rows).to_csv(path, index=False)
+        pd.DataFrame(rows).to_csv(path, index=False) # type: ignore
         QtWidgets.QMessageBox.information(self, "Export", f"Opgeslagen {len(rows)} rijen naar:\n{path}")
-
-    # --------- Filter handling ----------
-    def on_filter_toggle(self, checked: bool):
-        self.use_filter = bool(checked)
-        if not self.use_filter:
-            self.y_filt = None
-        self.draw_waveform()
-        self.draw_spectrogram()
-
-    def on_apply_filter(self):
-        self.filter_params = dict(
-            lowcut=int(self.spin_low.value()),
-            highcut=int(self.spin_high.value()),
-            order=int(self.spin_order.value()),
-        )
-        self.y_filt = None
-        if self.use_filter:
-            self.draw_waveform()
-            self.draw_spectrogram()
 
     # --------- Labels dataset JSON ----------
     def load_labels_json(self):
@@ -754,7 +1108,7 @@ class App(QtWidgets.QMainWindow):
         with open(js, "w", encoding="utf-8") as fh:
             json.dump(self.state.to_json(), fh, ensure_ascii=False, indent=2)
 
-    # --------- Navigation ----------
+    # --------- Navigatie ----------
     def advance(self, step: int):
         self.player.stop()
         new = self.idx + step
