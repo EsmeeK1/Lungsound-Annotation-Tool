@@ -12,6 +12,7 @@ data/
 temp/
 models/
 .venv/
+experiments/export_model/
 
 # Compiled Java class files
 *.class
