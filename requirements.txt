@@ -1,7 +1,13 @@
+# Core app
 PySide6
 pyqtgraph
 numpy
 pandas
-soundfile
 scipy
+soundfile
 sounddevice
+librosa
+
+# Notebook/visualisatie
+matplotlib
+ipywidgets
