@@ -10,9 +10,13 @@ dist/
 # Folders
 data/
 temp/
-models/
 .venv/
-experiments/export_model/
+experiments/exported_models
+
+# Models
+experiments/misc/models/bundles/hoest-vs-normaal-1.0.0/cnn_normaal_vs_hoest.tflite
+experiments/misc/models/bundles/hart-vs-normaal-1.0.0/cnn_normaal_vs_hart.tflite
+experiments/misc/models/bundles/hart-vs-hoest-1.0.0/cnn_hoest_vs_hart.tflite
 
 # Compiled Java class files
 *.class
