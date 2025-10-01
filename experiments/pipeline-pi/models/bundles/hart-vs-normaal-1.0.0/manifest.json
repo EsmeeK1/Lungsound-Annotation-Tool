@@ -1,0 +1,26 @@
+{
+    "name": "hart-vs-normaal",
+    "version": "1.0.0",
+    "preprocess_mode": "plugin",
+    "sample_rate": 15750,
+    "raw_window_seconds": 3.0,
+    "stft": {
+        "n_fft": 1024,
+        "hop": 256,
+        "window": "hann"
+    },
+    "bandpass": {
+        "low_hz": 20.0,
+        "high_hz": 600.0,
+        "order": 4,
+        "zero_phase": true
+    },
+    "input_shape": [
+        513,
+        182,
+        1
+    ],
+    "input_dtype": "float32",
+    "num_classes": 2,
+    "model_sha256": "FILL_ME_AFTER_HASH"
+}
