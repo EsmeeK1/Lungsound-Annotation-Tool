@@ -1,0 +1,6 @@
+models/bundles/<name>-<semver>/
+├─ model.tflite
+├─ preprocess.py
+├─ labels.json
+└─ manifest.json
+
