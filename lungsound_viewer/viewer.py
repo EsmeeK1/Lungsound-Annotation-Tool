@@ -13,26 +13,80 @@ import soundfile as sf
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 from scipy.signal import butter, sosfiltfilt, sosfilt
+from pathlib import Path
+
+# Map van dit script (viewer.py)
+APP_DIR = Path(__file__).resolve().parent
+# Vaste locatie voor labels_dataset.json
+LABELS_JSON_PATH = APP_DIR / "labels_dataset.json"
+
 
 # -------------------------
 # Config & constants
 # -------------------------
-EXPECTED_DURATION_S = 30.0
 DEFAULT_SR = 16000
 TIME_SNAP = 0.01
 
-LABEL_PALETTE = [
-    ("Inademing", (80, 180, 255, 60)),
-    ("Uitademing", (255, 200, 80, 60)),
-    ("Piep (Wheeze)", (255, 120, 120, 60)),
-    ("Knetter (Crackle)", (120, 255, 160, 60)),
-    ("Rhonchi", (200, 160, 255, 60)),
-    ("Stridor", (255, 140, 220, 60)),
-    ("Pleura-wrijving", (160, 200, 200, 60)),
-    ("Hoest", (255, 170, 120, 60)),
-    ("Artefact", (180, 180, 180, 60)),
-    ("Normaal", (140, 220, 140, 60)),
-]
+# ---------- Label-kleuren (deterministisch, bibliotheekpalet) ----------
+try:
+    from matplotlib import cm, colors as mpl_colors
+    _HAVE_MPL = True
+except Exception:
+    _HAVE_MPL = False
+
+def _to_qcolor_tuple(c, alpha=60):
+    # accepteer matplotlib RGBA of hex; retourneer (r,g,b,a) 0-255
+    if isinstance(c, str) and c.startswith("#") and len(c) in (7, 9):
+        q = QtGui.QColor(c)
+        return (q.red(), q.green(), q.blue(), alpha)
+    if isinstance(c, (list, tuple)) and len(c) in (3, 4):
+        r, g, b = c[:3]
+        if any(v <= 1.0 for v in (r, g, b)):  # mpl 0..1
+            r, g, b = int(r*255), int(g*255), int(b*255)
+        return (r, g, b, alpha)
+    return (120, 120, 120, alpha)
+
+def _qualitative_palette(n: int):
+    """
+    Geef n kleuren uit een vast palet.
+    - Eerst probeer 'tab20' (stabiel, 20 duidelijke categorieën).
+    - Zo niet, val terug op een handgemaakte reeks (Set3-achtig).
+    """
+    if _HAVE_MPL:
+        cmap = cm.get_cmap('tab20', max(2, n))
+        return [_to_qcolor_tuple(cmap(i)) for i in range(n)]
+    # Fallback zonder matplotlib (hexes van Set3-achtig palet)
+    base = [
+        "#8dd3c7","#ffffb3","#bebada","#fb8072","#80b1d3",
+        "#fdb462","#b3de69","#fccde5","#d9d9d9","#bc80bd",
+        "#ccebc5","#ffed6f","#1b9e77","#d95f02","#7570b3",
+        "#e7298a","#66a61e","#e6ab02","#a6761d","#666666",
+    ]
+    if n <= len(base):
+        return [_to_qcolor_tuple(h) for h in base[:n]]
+    # repeat (deterministisch)
+    return [_to_qcolor_tuple(base[i % len(base)]) for i in range(n)]
+
+class LabelColorMap:
+    """Houdt een stabiele mapping label -> kleur bij, o.b.v. labels_dataset.json"""
+    def __init__(self):
+        self.labels: list[str] = []
+        self.colors: list[tuple[int,int,int,int]] = []
+        self.map: dict[str, tuple[int,int,int,int]] = {}
+
+    def build(self, labels: list[str]):
+        self.labels = list(labels)
+        self.colors = _qualitative_palette(len(self.labels))
+        self.map = {lab: col for lab, col in zip(self.labels, self.colors)}
+
+    def color_for(self, labels_in_segment: list[str]):
+        # Kies de eerste bekende labelkleur; anders grijs
+        for L in labels_in_segment:
+            if L in self.map:
+                return self.map[L]
+        return (120,120,120,40)
+
+LABEL_COLORS = LabelColorMap()
 
 # Sneller tekenen: geen antialias (lijnen), en laat OpenGL uit (kan wisselend presteren)
 pg.setConfigOptions(imageAxisOrder='row-major', antialias=False, useOpenGL=False)
@@ -88,8 +142,9 @@ def json_sidecar_path(wav_path: str) -> str:
 def csv_path_for_root(root: str) -> str:
     return os.path.join(root, "labels_export.csv")
 
-def labels_dataset_path(root: str) -> str:
-    return os.path.join(root, "labels_dataset.json")
+def labels_dataset_path() -> str:
+    """Altijd het centrale JSON-bestand naast viewer.py."""
+    return str(LABELS_JSON_PATH)
 
 def ensure_dir(path: str):
     d = os.path.dirname(path)
@@ -113,10 +168,12 @@ def bandpass_filter(x: np.ndarray, fs: float, fc=(50.0, 2000.0), order=2, zero_p
         return sosfiltfilt(sos, x, axis=axis)
     else:
         return sosfilt(sos, x, axis=axis) # type: ignore
+
+
 # -------------------------
 # Debug helpers
 # -------------------------
-DEBUG_STFT = True                 # zet op False om prints uit te zetten
+DEBUG_STFT = False                 # zet op False om prints uit te zetten
 DYNAMIC_SPECTRO_LEVELS = False    # True = levels uit percentielen (handig bij debug)
 GRAYSCALE_DEBUG = True            # tijdelijk op True zetten om LUT/levels te omzeilen
 
@@ -251,58 +308,118 @@ class StartDialog(QtWidgets.QDialog):
     """Startdialoog om sessiemetadata te kiezen en een root-map te selecteren."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Start – Lung Sound Annotator")
-        self.setModal(True)
-        self.resize(520, 280)
+        self.setWindowTitle("Selecteer dataset en meta")
+        self.resize(480, 300)
+
         v = QtWidgets.QVBoxLayout(self)
 
-        form = QtWidgets.QFormLayout()
+        # --- Boven: dataset-map kiezen ---
+        form_top = QtWidgets.QFormLayout()
+        self.btn_choose = QtWidgets.QPushButton("Kies map…")
+        self.le_root    = QtWidgets.QLineEdit()
+        self.le_root.setReadOnly(True)
+        form_top.addRow("Datasetmap:", self.btn_choose)
+        form_top.addRow("Gekozen pad:", self.le_root)
+        v.addLayout(form_top)
+
+        # --- Metadata-groep ---
+        grp = QtWidgets.QGroupBox()
+        grp_layout = QtWidgets.QVBoxLayout(grp)
+
+        # Kopregel in de groupbox met titel + kleine info-knop
+        header = QtWidgets.QHBoxLayout()
+        lbl_hdr = QtWidgets.QLabel("Metadata (optioneel)")
+        lbl_hdr.setStyleSheet("font-weight: 600;")
+        self.btn_info = QtWidgets.QToolButton()
+        self.btn_info.setText("?")
+        self.btn_info.setToolTip("Korte uitleg over de velden")
+        self.btn_info.setFixedWidth(24)
+        self.btn_info.clicked.connect(self._show_meta_info)
+        header.addWidget(lbl_hdr)
+        header.addStretch(1)
+        header.addWidget(self.btn_info)
+        grp_layout.addLayout(header)
+
+        # Form in de groupbox
+        form_meta = QtWidgets.QFormLayout()
+
+        # Geslacht
         self.gender = QtWidgets.QComboBox()
-        self.gender.addItems(["", "Vrouw", "Man", "Overig", "Onbekend"])
+        self.gender.addItems(["", "Man", "Vrouw", "Onbekend"])
+        self.gender.setToolTip("Niet per se nodig; alleen invullen als je analyses op geslacht wilt doen.")
+
+        # Leeftijd
         self.age = QtWidgets.QSpinBox()
-        self.age.setRange(0, 120); self.age.setSpecialValueText("")
-        self.location = QtWidgets.QComboBox()
-        self.location.addItems([""] + [f"Opnamelocatie {i}" for i in range(1, 12+1)])
-        form.addRow("Geslacht (optioneel):", self.gender)
-        form.addRow("Leeftijd (optioneel):", self.age)
-        form.addRow("Opnamelocatie:", self.location)
-        v.addLayout(form)
+        self.age.setRange(0, 120)
+        self.age.setSpecialValueText("")      # toont leeg bij minimum
+        self.age.setValue(self.age.minimum()) # start leeg
+        self.age.setToolTip("Niet per se nodig; laat leeg als onbekend of niet relevant voor je analyse.")
 
-        self.btn_pick = QtWidgets.QPushButton("Kies map met .wav bestanden…")
-        v.addWidget(self.btn_pick)
+        # Opnamelocatie
+        self.location = QtWidgets.QLineEdit()
+        self.location.setToolTip("Aanbevolen bij longgeluid: het type/intensiteit kan per locatie verschillen.")
 
-        self.lbl_folder = QtWidgets.QLabel("Geen map gekozen")
-        self.lbl_folder.setStyleSheet("color:#777;")
-        v.addWidget(self.lbl_folder)
+        form_meta.addRow("Geslacht:", self.gender)
+        form_meta.addRow("Leeftijd:", self.age)
+        form_meta.addRow("Opnamelocatie:", self.location)
 
-        h = QtWidgets.QHBoxLayout()
-        self.btn_cancel = QtWidgets.QPushButton("Annuleren")
-        self.btn_ok = QtWidgets.QPushButton("Start")
-        self.btn_ok.setEnabled(False)
-        h.addStretch(1); h.addWidget(self.btn_cancel); h.addWidget(self.btn_ok)
-        v.addLayout(h)
+        grp_layout.addLayout(form_meta)
+        v.addWidget(grp)
 
-        self.btn_pick.clicked.connect(self.pick_folder)
-        self.btn_cancel.clicked.connect(self.reject)
-        self.btn_ok.clicked.connect(self.accept)
+        # --- Knoppen (OK standaard uit tot er een map is gekozen) ---
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        v.addWidget(btns)
+        self._btn_ok = btns.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        self._btn_ok.setEnabled(False)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
 
-        self.root = None
+        # Map kiezen
+        self.root = ""  # start leeg
+        self.btn_choose.clicked.connect(self.pick_folder)
+
+    def _show_meta_info(self):
+        txt = (
+            "Korte toelichting velden:\n\n"
+            "• Geslacht: niet per se nodig; alleen invullen als je analyses wilt doen met deze variabele.\n"
+            "• Leeftijd: niet per se nodig; laat leeg als onbekend of niet relevant voor je analyse.\n"
+            "• Opnamelocatie: aanbevolen bij longgeluid. Het type en de intensiteit van geluid kunnen per locatie verschillen."
+        )
+        QtWidgets.QMessageBox.information(self, "Uitleg metadata", txt)
 
     def pick_folder(self):
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Selecteer root-map")
-        if not d: return
-        self.root = d
-        self.lbl_folder.setText(d)
-        self.btn_ok.setEnabled(True)
+        # Directory-dialoog (robust, non-native fallback)
+        dlg = QtWidgets.QFileDialog(self, "Selecteer root-map")
+        dlg.setFileMode(QtWidgets.QFileDialog.FileMode.Directory)
+        dlg.setOption(QtWidgets.QFileDialog.Option.ShowDirsOnly, True)
+        try:
+            dlg.setOption(QtWidgets.QFileDialog.Option.DontUseNativeDialog, True)
+        except Exception:
+            pass
+        if getattr(self, "root", ""):
+            dlg.setDirectory(self.root)
+
+        if dlg.exec():
+            sel = dlg.selectedFiles()
+            if sel:
+                self.root = sel[0]
+                self.le_root.setText(self.root)
+                self._btn_ok.setEnabled(True)
 
     def get_meta(self) -> Dict[str, object]:
         meta = {}
         g = self.gender.currentText().strip()
         a = self.age.value()
-        loc = self.location.currentText().strip()
-        if g: meta["gender"] = g
-        if a > 0: meta["age"] = int(a)
-        if loc: meta["location"] = loc
+        loc = self.location.text().strip()
+        if g:
+            meta["gender"] = g
+        if a > 0:
+            meta["age"] = int(a)
+        if loc:
+            meta["location"] = loc
         return meta
 
 class ClickableRegion(pg.LinearRegionItem):
@@ -340,11 +457,11 @@ class AutoSegmentDialog(QtWidgets.QDialog):
         self.chk_replace = QtWidgets.QCheckBox("Vervang bestaande segmenten")
         self.chk_replace.setChecked(default_replace)
 
-        # NIEUW: label-keuze
+        # Label-keuze: altijd op basis van doorgegeven opties (uit labels_dataset.json)
         self.combo_label = QtWidgets.QComboBox()
-        label_options = label_options or [name for name, _ in LABEL_PALETTE]
-        self.combo_label.addItems(label_options)
-        if default_label and default_label in label_options:
+        if label_options:
+            self.combo_label.addItems(label_options)
+        if default_label and default_label in (label_options or []):
             self.combo_label.setCurrentText(default_label)
 
         form.addRow("Segmentlengte (s):", self.len_s)
@@ -450,7 +567,7 @@ class App(QtWidgets.QMainWindow):
 
         # Tijdslider + label
         self.time_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.time_slider.setRange(0, int(EXPECTED_DURATION_S*100))
+        self.time_slider.setRange(0, 0)   # dynamisch, bij laden bestand gezet
         self.lbl_time = QtWidgets.QLabel("0.00 s")
         tbar = QtWidgets.QHBoxLayout()
         tbar.addWidget(QtWidgets.QLabel("Tijd:")); tbar.addWidget(self.time_slider, 1); tbar.addWidget(self.lbl_time)
@@ -467,8 +584,20 @@ class App(QtWidgets.QMainWindow):
         self.btn_open_folder = QtWidgets.QPushButton("Open folder…")
         rv.addWidget(self.btn_open_folder)
 
-        nav = QtWidgets.QHBoxLayout(); self.btn_prev = QtWidgets.QPushButton("◀ Prev"); self.btn_next = QtWidgets.QPushButton("Next ▶")
-        nav.addWidget(self.btn_prev); nav.addWidget(self.btn_next); rv.addLayout(nav)
+        self.btn_prev = QtWidgets.QPushButton("◀ Prev")
+        self.btn_next = QtWidgets.QPushButton("Next ▶")
+
+        self.combo_jump = QtWidgets.QComboBox()
+        self.combo_jump.setEnabled(False)
+        self.combo_jump.setMinimumWidth(280)
+        self.combo_jump.currentIndexChanged.connect(self._on_jump_selected)
+
+        nav_row = QtWidgets.QHBoxLayout()
+        nav_row.addWidget(self.btn_prev)
+        nav_row.addWidget(self.btn_next)
+        nav_row.addWidget(QtWidgets.QLabel("Jump to:"))
+        nav_row.addWidget(self.combo_jump)
+        rv.addLayout(nav_row)
 
         # "Selected:" met invoervelden die gekoppeld zijn aan de sleep-regio
         sel_row = QtWidgets.QHBoxLayout()
@@ -491,7 +620,6 @@ class App(QtWidgets.QMainWindow):
         vb = QtWidgets.QVBoxLayout(box)
 
         self.combo_labels = QtWidgets.QComboBox()
-        self.combo_labels.addItems([name for name, _ in LABEL_PALETTE])
 
         hb = QtWidgets.QHBoxLayout()
         self.txt_new_label = QtWidgets.QLineEdit()
@@ -525,7 +653,7 @@ class App(QtWidgets.QMainWindow):
         hb2 = QtWidgets.QHBoxLayout(); self.btn_update = QtWidgets.QPushButton("Update"); self.btn_delete = QtWidgets.QPushButton("Delete")
         hb2.addWidget(self.btn_update); hb2.addWidget(self.btn_delete); rv.addLayout(hb2)
 
-                # --- Bandpass filter (rechts) ---
+        # --- Bandpass filter (rechts) ---
         grp_bp = QtWidgets.QGroupBox("Bandpass-filter")
         fv = QtWidgets.QFormLayout(grp_bp)
 
@@ -538,7 +666,18 @@ class App(QtWidgets.QMainWindow):
         self.sp_order.setRange(1, 10); self.sp_order.setValue(2)
         self.chk_zero = QtWidgets.QCheckBox("Zero-phase"); self.chk_zero.setChecked(True)
 
-        fv.addRow(self.chk_bp)
+        row_top = QtWidgets.QHBoxLayout()
+        row_top.addWidget(self.chk_bp)
+        row_top.addStretch(1)
+
+        self.btn_bp_info = QtWidgets.QToolButton()
+        self.btn_bp_info.setText("Info")
+        self.btn_bp_info.setToolTip("Uitleg over filterinstellingen")
+        self.btn_bp_info.clicked.connect(self._show_bp_info)
+        row_top.addWidget(self.btn_bp_info)
+
+        fv.addRow(row_top)
+
         fv.addRow("Low (Hz):", self.sp_low)
         fv.addRow("High (Hz):", self.sp_high)
         fv.addRow("Order:", self.sp_order)
@@ -559,12 +698,22 @@ class App(QtWidgets.QMainWindow):
 
         # Export
         self.btn_export_csv = QtWidgets.QPushButton("Export CSV"); rv.addWidget(self.btn_export_csv)
+        # Klein statuslabel met laatst geëxporteerde locatie
+        self.lbl_last_export = QtWidgets.QLabel("Laatst geëxporteerd: —")
+        self.lbl_last_export.setStyleSheet("color: gray; font-size: 10pt;")
+        self.lbl_last_export.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        rv.addWidget(self.lbl_last_export)
 
         # Shortcuts
         QtGui.QShortcut(QtGui.QKeySequence("Space"), self, self.toggle_play)
         QtGui.QShortcut(QtGui.QKeySequence("N"), self, lambda: self.advance(+1))
         QtGui.QShortcut(QtGui.QKeySequence("P"), self, lambda: self.advance(-1))
+        QtGui.QShortcut(QtGui.QKeySequence("Return"), self, self.update_segment)
+        QtGui.QShortcut(QtGui.QKeySequence("Enter"),  self, self.update_segment)
         QtGui.QShortcut(QtGui.QKeySequence("Delete"), self, self.delete_selected)
+
 
         # Arrow-key nudges voor selectie-regio (0.01 s per stap)
         for seq, cb in [
@@ -615,16 +764,18 @@ class App(QtWidgets.QMainWindow):
 
         # opties voor dropdown: huidige combobox + defaults uit labels_dataset.json
         label_options = [self.combo_labels.itemText(i) for i in range(self.combo_labels.count())]
-        default_label = self.combo_labels.currentText() if self.combo_labels.count() > 0 else None
+        default_label = getattr(self, "_auto_seg_cfg", {}).get("label", self.combo_labels.currentText() if self.combo_labels.count() else None)
+        default_len   = float(getattr(self, "_auto_seg_cfg", {}).get("length_s", 3.0))
+        default_ovl   = float(getattr(self, "_auto_seg_cfg", {}).get("overlap_s", 0.0))
 
-        dlg = AutoSegmentDialog(
-            self,
-            default_len=3.00,
-            default_overlap=0.00,
+        dlg = AutoSegmentDialog(self,
+            default_len=default_len,
+            default_overlap=default_ovl,
             default_replace=False,
             label_options=label_options,
             default_label=default_label
         )
+
         if not dlg.exec():
             return
         seg_len, seg_ovl, replace, auto_label = dlg.values()
@@ -672,7 +823,6 @@ class App(QtWidgets.QMainWindow):
             idx = len(self.state.segments) - len(new_segments)
             self.list.setCurrentRow(max(0, idx))
 
-
     # --------- Folder flow ----------
     def open_folder_dialog(self, first=False):
         """Toon startdialoog en (opnieuw) bouw de filequeue."""
@@ -680,18 +830,22 @@ class App(QtWidgets.QMainWindow):
 
         dlg = StartDialog(self)
         if not dlg.exec():
-            if first: sys.exit(0)
+            # if first: sys.exit(0)   # weg
             return
+
         self.root = dlg.root or ""
         self.session_meta = dlg.get_meta()
         self.load_labels_json()
         self.build_file_queue(self.root)
         if not self.files:
             QtWidgets.QMessageBox.information(self, "Info", "Geen .wav-bestanden gevonden.")
-            if first: sys.exit(0)
+            # if first: sys.exit(0)   # weg
             return
+
+        self._populate_jump_list()
         self.idx = 0
         self.load_current()
+
 
     def build_file_queue(self, root: str):
         """Verzamel .wav-bestanden: eerst top-level, daarna submappen."""
@@ -742,10 +896,11 @@ class App(QtWidgets.QMainWindow):
 
         # Default selectie
         self._blocking = True
-        self.region.setRegion((0.0, 3.0))
+        init_len = min(3.0, float(len(self.y_raw))/self.sr)  # 3 s of minder als opname kort is # type: ignore
+        self.region.setRegion((0.0, init_len))
         self.sel_start.setValue(0.0)
-        self.sel_end.setValue(3.0)
-        self.lbl_sel_delta.setText("(Δ 3.00 s)")
+        self.sel_end.setValue(init_len)
+        self.lbl_sel_delta.setText(f"(Δ {init_len:.2f} s)")
         self._blocking = False
 
         self.refresh_segment_list()
@@ -855,6 +1010,30 @@ class App(QtWidgets.QMainWindow):
                 self.p_wave.addItem(reg)
 
     # --------- Spectrogram ----------
+    # STFT instellingen
+    def _show_stft_info(self):
+        txt = (
+            "Korte uitleg STFT parameters:\n\n"
+            "• nperseg: aantal samples per FFT-frame (groot = betere frequentieresolutie, maar grover in tijd).\n"
+            "• hop: stapgrootte tussen opeenvolgende frames (klein = vloeiendere tijdsresolutie, maar meer data).\n"
+            "• window: vensterfunctie (Hann vermindert randartefacten, standaard voor audio).\n\n"
+            "Let op: deze instellingen beïnvloeden alleen hoe het spectrogram getoond wordt, "
+            "niet de segmenten of het audio zelf."
+        )
+        QtWidgets.QMessageBox.information(self, "STFT parameters", txt)
+
+    def _show_bp_info(self):
+        txt = (
+            "Bandpass-filter – korte uitleg:\n\n"
+            "• Long focus (80–3000 Hz): dempt lage harttonen en pakt de hogere energie van veel longgeluiden mee.\n"
+            "• Hart focus (20–250 Hz): richt zich op S1/S2 en lage-frequentiecomponenten; murmurs kunnen iets hoger liggen.\n\n"
+            "• Order (4–6 aanbevolen): hogere orde = steilere randen, maar meer kans op ringing/instabiliteit.\n"
+            "  Orde 4 is een veilige, stabiele keuze.\n"
+            "• Zero-phase (aan/uit): ‘aan’ gebruikt forward–backward filtering (geen fasevertraging, wel niet-causaal).\n"
+            "  Gebruik ‘aan’ voor offline analyse/visualisatie; ‘uit’ voor echte realtime-ketens met minimale latentie.\n"
+        )
+        QtWidgets.QMessageBox.information(self, "Bandpass – Info", txt)
+
     def init_spectrogram(self, grid_layout: QtWidgets.QGridLayout):
         """Create the spectrogram plot below the waveform."""
         self.p_spec = pg.PlotWidget()
@@ -884,13 +1063,30 @@ class App(QtWidgets.QMainWindow):
         # Onder de tijdslider plaatsen (rij 2, kolom 0)
         grid_layout.addWidget(self.p_spec, 2, 0)
 
+        # Info-blok onder het spectrogram
+        row = QtWidgets.QHBoxLayout()
+        self.lbl_stft_params = QtWidgets.QLabel("")
+        self.lbl_stft_params.setStyleSheet("color: gray; font-size: 10pt;")
+        row.addWidget(self.lbl_stft_params)
+
+        self.btn_stft_info = QtWidgets.QToolButton()
+        self.btn_stft_info.setText("Info")
+        self.btn_stft_info.clicked.connect(self._show_stft_info)
+        row.addWidget(self.btn_stft_info)
+
+        grid_layout.addLayout(row, 3, 0)
+
     def update_spectrogram(self):
         """Compute STFT en teken als image."""
         y = self.current_signal()
         if y is None or len(y) == 0:
             _dbg("[STFT] geen data"); return
 
-        f, t, S_db = compute_stft_db(y, self.sr, nperseg=1024, hop=256, window="hann")
+        cfg = getattr(self, "_stft_cfg", {"nperseg":1024,"hop":256,"window":"hann"})
+        f, t, S_db = compute_stft_db(y, self.sr,
+                                    nperseg=int(cfg.get("nperseg",1024)),
+                                    hop=int(cfg.get("hop",256)),
+                                    window=str(cfg.get("window","hann")))
         if S_db.size == 0:
             _dbg("[STFT] lege spectrogram array"); return
 
@@ -950,6 +1146,12 @@ class App(QtWidgets.QMainWindow):
             self.p_spec.setXRange(0.0, t_max)
             self.p_spec.setYRange(0.0, f_max)
             _dbg(f"[UI] rect set: t_max={t_max:.3f}s f_max={f_max:.1f}Hz img.shape={img.shape}")
+
+        # Toon de huidige STFT-settings
+        cfg = getattr(self, "_stft_cfg", {"nperseg":1024,"hop":256,"window":"hann"})
+        self.lbl_stft_params.setText(
+            f"STFT: nperseg={cfg.get('nperseg')} | hop={cfg.get('hop')} | window={cfg.get('window')}"
+        )
 
     # --------- Interactions ----------
     def on_region_changed(self):
@@ -1052,10 +1254,7 @@ class App(QtWidgets.QMainWindow):
 
     # --------- Segments CRUD ----------
     def _brush_for_labels(self, labels: List[str]):
-        for L, color in LABEL_PALETTE:
-            if L in labels:
-                return color
-        return (120,120,120,40)
+        return LABEL_COLORS.color_for(labels)
 
     def refresh_segment_list(self):
         self.list.clear()
@@ -1107,6 +1306,7 @@ class App(QtWidgets.QMainWindow):
         self.refresh_segment_list()
         self.list.setCurrentRow(self.state.segments.index(seg))
         self.save_json()
+        self.rebuild_label_list()
 
     def on_list_selection(self, row: int):
         if not self.state or row < 0 or row >= len(self.state.segments):
@@ -1114,9 +1314,7 @@ class App(QtWidgets.QMainWindow):
         s = self.state.segments[row]
         self.spin_start.setValue(s.t_start)
         self.spin_end.setValue(s.t_end)
-        self.list_labels.clear()
-        for L in s.labels:
-            self.list_labels.addItem(L)
+        self.rebuild_label_list()
         self._blocking = True
         self.region.setRegion((s.t_start, s.t_end))
         self.sel_start.setValue(s.t_start)
@@ -1134,6 +1332,7 @@ class App(QtWidgets.QMainWindow):
         self.on_list_selection(row)
         self.refresh_segment_list()
         self.save_json()
+        self.rebuild_label_list()
 
     def update_segment(self):
         row = self.list.currentRow()
@@ -1146,6 +1345,7 @@ class App(QtWidgets.QMainWindow):
         self.refresh_segment_list()
         self.list.setCurrentRow(row)
         self.save_json()
+        self.rebuild_label_list()
 
     def delete_selected(self):
         row = self.list.currentRow()
@@ -1155,6 +1355,49 @@ class App(QtWidgets.QMainWindow):
         del self.state.segments[row]
         self.refresh_segment_list()
         self.save_json()
+
+    # --------- Padnamen ----------
+    def _rel_display_name(self, abspath: str) -> str:
+        """
+        Toon een leesbare, relatieve padnaam vanaf self.root.
+        """
+        try:
+            rel = os.path.relpath(abspath, self.root)
+        except Exception:
+            rel = os.path.basename(abspath)
+        return rel.replace("\\", "/")
+
+    # --------- Jump list ----------
+    def _populate_jump_list(self):
+        self.combo_jump.blockSignals(True)
+        self.combo_jump.clear()
+
+        display_names = []
+        for p in self.files:
+            abspath = p if isinstance(p, str) else getattr(p, "path", "")
+            display_names.append(self._rel_display_name(abspath))
+
+        self.combo_jump.addItems(display_names)
+        self.combo_jump.setEnabled(len(display_names) > 0)
+
+        if 0 <= self.idx < len(display_names):
+            self.combo_jump.setCurrentIndex(self.idx)
+
+        self.combo_jump.blockSignals(False)
+
+    def _on_jump_selected(self, i: int):
+        if not (0 <= i < len(self.files)):
+            return
+        if i == self.idx:
+            return
+        self.idx = i
+        self.load_current()
+
+    def _after_navigation_changed(self):
+        if self.combo_jump.isEnabled() and 0 <= self.idx < self.combo_jump.count():
+            self.combo_jump.blockSignals(True)
+            self.combo_jump.setCurrentIndex(self.idx)
+            self.combo_jump.blockSignals(False)
 
     # --------- Export ----------
     def export_csv(self):
@@ -1188,29 +1431,73 @@ class App(QtWidgets.QMainWindow):
         pd.DataFrame(rows).to_csv(path, index=False) # type: ignore
         QtWidgets.QMessageBox.information(self, "Export", f"Opgeslagen {len(rows)} rijen naar:\n{path}")
 
+    def _set_last_export_path(self, path: str):
+        """Update het statuslabel met de laatst geëxporteerde locatie."""
+        # Nettere, korte weergave (elide in het midden als het lang is)
+        shown = path
+        max_chars = 80
+        if len(shown) > max_chars:
+            shown = shown[:40] + " … " + shown[-35:]
+        self.lbl_last_export.setText(f"Laatst geëxporteerd: {shown}")
+        self.lbl_last_export.setToolTip(path)  # volledige pad als tooltip
+
     # --------- Labels dataset JSON ----------
     def load_labels_json(self):
-        path = labels_dataset_path(self.root)
-        if os.path.isfile(path):
+        path = labels_dataset_path()
+
+        # Fallback-config als bestand (nog) niet bestaat
+        default_cfg = {
+            "version": 1,
+            "updated": datetime.datetime.now().isoformat(timespec="seconds"),
+            "labels": [
+                "Hoest","Normaal","Hartslag","Piep (Wheeze)","Knetter (Crackle)"
+            ],
+            "meta_defaults": {"gender":"","age":"","location":""},
+            "filter_defaults": {"lowcut": 50, "highcut": 3000, "order": 4, "zero_phase": True},
+            "stft_params": {"nperseg": 1024, "hop": 256, "window": "hann"},
+            "auto_segment_defaults": {"length_s": 3.00, "overlap_s": 0.00, "label": "Hoest"}
+        }
+
+        # Lees centrale JSON of maak ‘m daar aan (niet in de datamap)
+        if LABELS_JSON_PATH.is_file():
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                labels = d.get("labels", [])
-                if labels:
-                    self.combo_labels.clear()
-                    self.combo_labels.addItems(labels)
-                defaults = d.get("meta_defaults", {})
-                for k, v in defaults.items():
-                    self.session_meta.setdefault(k, v)
+                    cfg = json.load(f)
             except Exception:
-                pass
+                cfg = default_cfg
         else:
-            d = {"labels": [name for name,_ in LABEL_PALETTE], "meta_defaults": self.session_meta}
+            cfg = default_cfg
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(d, f, ensure_ascii=False, indent=2)
+                json.dump(default_cfg, f, ensure_ascii=False, indent=2)
+
+        # Labels → combobox
+        labels = cfg.get("labels", [])
+        self.combo_labels.clear()
+        if labels:
+            self.combo_labels.addItems(labels)
+
+        # Label-kleurenmapping opbouwen (zoals we eerder hebben toegevoegd)
+        LABEL_COLORS.build(labels)
+
+        # Meta defaults
+        defaults = cfg.get("meta_defaults", {})
+        for k, v in defaults.items():
+            self.session_meta.setdefault(k, v)
+
+        # Filter defaults
+        fdef = cfg.get("filter_defaults", {})
+        if "lowcut" in fdef:     self.sp_low.setValue(float(fdef["lowcut"]))
+        if "highcut" in fdef:    self.sp_high.setValue(float(fdef["highcut"]))
+        if "order" in fdef:      self.sp_order.setValue(int(fdef["order"]))
+        if "zero_phase" in fdef: self.chk_zero.setChecked(bool(fdef["zero_phase"]))
+
+        # STFT + Auto-segment defaults in geheugen
+        self._stft_cfg     = cfg.get("stft_params", {"nperseg":1024,"hop":256,"window":"hann"})
+        self._auto_seg_cfg = cfg.get("auto_segment_defaults", {"length_s":3.0,"overlap_s":0.0,"label":labels[0] if labels else ""})
+
 
     def add_label_to_dataset(self, label: str):
-        path = labels_dataset_path(self.root)
+        path = labels_dataset_path()
         d = {"labels": [], "meta_defaults": self.session_meta}
         if os.path.isfile(path):
             try:
@@ -1222,6 +1509,63 @@ class App(QtWidgets.QMainWindow):
             d["labels"] = d.get("labels", []) + [label]
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(d, f, ensure_ascii=False, indent=2)
+
+    def rebuild_label_list(self):
+        """Vul self.list_labels met per label een widget: 'naam  [×]'."""
+        self.list_labels.clear()
+        row = self.list.currentRow()
+        if not self.state or row < 0 or row >= len(self.state.segments):
+            return
+        seg = self.state.segments[row]
+
+        for L in seg.labels:
+            item = QtWidgets.QListWidgetItem(self.list_labels)
+            item.setSizeHint(QtCore.QSize(0, 26))
+
+            w = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(w)
+            h.setContentsMargins(6, 2, 6, 2)
+            h.setSpacing(8)
+
+            lbl = QtWidgets.QLabel(L)
+            btn = QtWidgets.QToolButton()
+            btn.setText("×")
+            btn.setToolTip(f"Verwijder label: {L}")
+            btn.setFixedSize(22, 22)
+            btn.setStyleSheet("QToolButton { font-weight: bold; }")
+            # Koppel de labelwaarde aan de knop
+            btn.setProperty("label_text", L)
+            btn.clicked.connect(self._on_remove_label_btn)
+
+            h.addWidget(lbl)
+            h.addStretch(1)
+            h.addWidget(btn)
+
+            self.list_labels.addItem(item)
+            self.list_labels.setItemWidget(item, w)
+
+    def _on_remove_label_btn(self):
+        """Slot voor de ‘×’-knoppen in de labellijst."""
+        if not self.state:
+            return
+        sender = self.sender()
+        if not isinstance(sender, QtWidgets.QToolButton):
+            return
+        L = sender.property("label_text")
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.state.segments):
+            return
+        seg = self.state.segments[row]
+        try:
+            seg.labels.remove(L)
+        except ValueError:
+            return
+        # UI bijwerken
+        self.rebuild_label_list()
+        self.refresh_segment_list()   # overlays/tekst bijwerken
+        self.list.setCurrentRow(row)
+        self.save_json()
+
 
     def reload_labels_json(self):
         self.load_labels_json()
@@ -1238,9 +1582,11 @@ class App(QtWidgets.QMainWindow):
     def advance(self, step: int):
         self.player.stop()
         new = self.idx + step
-        if new < 0 or new >= len(self.files): return
+        if new < 0 or new >= len(self.files):
+            return
         self.idx = new
         self.load_current()
+        self._after_navigation_changed()
 
 # -------------------------
 # Main

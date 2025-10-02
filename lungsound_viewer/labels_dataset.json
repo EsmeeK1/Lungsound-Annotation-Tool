@@ -2,15 +2,11 @@
   "version": 1,
   "updated": "2025-09-18T11:42:53",
   "labels": [
-    "Inademing",
-    "Uitademing",
-    "Piep (Wheeze)",
-    "Knetter (Crackle)",
-    "Rhonchi",
-    "Stridor",
-    "Pleura-wrijving",
     "Hoest",
-    "Artefact"
+    "Normaal",
+    "Hartslag",
+    "Piep (Wheeze)",
+    "Knetter (Crackle)"
   ],
   "meta_defaults": {
     "gender": "",
@@ -18,9 +14,9 @@
     "location": ""
   },
   "filter_defaults": {
-    "lowcut": 120,
-    "highcut": 1800,
-    "order": 12
+    "lowcut": 80,
+    "highcut": 3000,
+    "order": 4
   },
   "stft_params": {
     "nperseg": 1024,
