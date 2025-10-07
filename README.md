@@ -6,6 +6,8 @@
 This project is a **Lung Sound Viewer & Annotation Tool** built with **PySide6** and **PyQtGraph**.
 Developed as part of the **HeartGuard / LungInsight project**, it enables loading, visualizing, annotating, and analyzing lung sound recordings. You can view waveforms and spectrograms, select intervals, label segments (e.g., “Inhalation”, “Exhalation”, “Wheeze”), and export annotations for research or machine learning.
 
+![Showcase of the UI Layout of the Tool](image.png)
+
 ### What is a lung sound?
 **Lung sounds** are audio signals recorded from the chest, reflecting airflow and respiratory events.
 Common types include:
@@ -42,7 +44,8 @@ pip install PySide6 pyqtgraph numpy pandas soundfile scipy sounddevice
 ### Usage
 Run the application:
 ```bash
-python lungsound_viewer_refactored.py
+cd viewer_app
+python app.py
 ```
 1. Choose a folder containing `.wav` files
 2. Optionally fill in metadata (gender, age, recording location)
@@ -52,6 +55,19 @@ python lungsound_viewer_refactored.py
 Each `.wav` file will have a corresponding `.json` sidecar with labels and metadata.
 
 ## Code description
+
+## File Structure
+- `app.py` — entrypoint
+- `src/` — package with modules:
+  - `config.py` — constants & paths
+  - `models.py` — dataclasses `Segment`, `FileState`
+  - `utils.py` — helpers, label color map
+  - `audio.py` — `bandpass_filter`, `compute_stft_db`, `Player`
+  - `dialogs.py` — `StartDialog`, `AutoSegmentDialog`
+  - `widgets.py` — custom PyQtGraph `ClickableRegion`
+  - `mainwindow.py` — `App` main window
+
+> `labels_dataset.json` will be created next to `app.py` if not present.
 
 ### Key components
 - **AudioLoader:** loads and parses `.wav` files
@@ -68,19 +84,6 @@ Each `.wav` file will have a corresponding `.json` sidecar with labels and metad
 - Interactive interval selection and labeling
 - Metadata entry (gender, age, location)
 - Right panel with label controls and export options
-
-## File Structure
-- `app.py` — entrypoint
-- `src/` — package with modules:
-  - `config.py` — constants & paths
-  - `models.py` — dataclasses `Segment`, `FileState`
-  - `utils.py` — helpers, label color map
-  - `audio.py` — `bandpass_filter`, `compute_stft_db`, `Player`
-  - `dialogs.py` — `StartDialog`, `AutoSegmentDialog`
-  - `widgets.py` — custom PyQtGraph `ClickableRegion`
-  - `mainwindow.py` — `App` main window
-
-> `labels_dataset.json` will be created next to `app.py` if not present.
 
 ## License
 Free to use and modify for research purposes.
