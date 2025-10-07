@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "updated": "2025-10-07T09:33:46",
+  "labels": [
+    "Hoest",
+    "Normaal",
+    "Hartslag",
+    "Piep (Wheeze)",
+    "Knetter (Crackle)"
+  ],
+  "meta_defaults": {
+    "gender": "",
+    "age": "",
+    "location": ""
+  },
+  "filter_defaults": {
+    "lowcut": 50,
+    "highcut": 3000,
+    "order": 4,
+    "zero_phase": true
+  },
+  "stft_params": {
+    "nperseg": 1024,
+    "hop": 256,
+    "window": "hann"
+  },
+  "auto_segment_defaults": {
+    "length_s": 3.0,
+    "overlap_s": 0.0,
+    "label": "Hoest"
+  }
+}
