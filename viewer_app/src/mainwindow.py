@@ -7,12 +7,12 @@ import soundfile as sf
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from .config import DEFAULT_SR, TIME_SNAP, LABELS_JSON_PATH, DEBUG_STFT, DYNAMIC_SPECTRO_LEVELS, GRAYSCALE_DEBUG
+from .config import DEFAULT_SR, TIME_SNAP, LABELS_JSON_PATH, DEBUG_STFT, DYNAMIC_SPECTRO_LEVELS, GRAYSCALE_DEBUG, METADATA_FIELDS
 from .models import Segment, FileState
 from .utils import snap_t, human_relpath, json_sidecar_path, csv_path_for_root, labels_dataset_path, ensure_dir, LABEL_COLORS
 from .audio import bandpass_filter, compute_stft_db, Player
 from .dialogs import StartDialog, AutoSegmentDialog
-from .widgets import ClickableRegion
+from .widgets import ClickableRegion, MetadataInlineEditor
 
 def _dbg(msg: str):
     if DEBUG_STFT:
@@ -87,7 +87,13 @@ class App(QtWidgets.QMainWindow):
         self.sel_end   = QtWidgets.QDoubleSpinBox(); self.sel_end.setDecimals(2); self.sel_end.setSingleStep(TIME_SNAP); self.sel_end.setRange(0, 1e6)
         self.lbl_sel_delta = QtWidgets.QLabel("(Δ 0.00 s)")
         sel_row.addWidget(self.sel_start); sel_row.addWidget(QtWidgets.QLabel("–")); sel_row.addWidget(self.sel_end); sel_row.addWidget(self.lbl_sel_delta)
+
         rv.addLayout(sel_row)
+
+        # Voeg direct daarna toe:
+        self.meta_inline = MetadataInlineEditor(METADATA_FIELDS, parent=right)
+        rv.addWidget(self.meta_inline)
+        self.meta_inline.changed.connect(self._on_meta_inline_changed)
 
         self.sel_start.valueChanged.connect(lambda _: self.on_sel_spin_changed())
         self.sel_end.valueChanged.connect(lambda _: self.on_sel_spin_changed())
@@ -347,7 +353,6 @@ class App(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-
     def on_region_changed(self):
         if self._blocking: return
         a, b = self.region.getRegion()
@@ -418,6 +423,13 @@ class App(QtWidgets.QMainWindow):
 
     def _brush_for_labels(self, labels: List[str]):
         return LABEL_COLORS.color_for(labels)
+
+    def _on_meta_inline_changed(self, values: dict):
+        if not self.state:
+            return
+        self.state.meta = dict(self.state.meta or {})
+        self.state.meta.update(values or {})
+        self.save_json()
 
     def refresh_segment_list(self):
         self.list.clear()
@@ -675,26 +687,45 @@ class App(QtWidgets.QMainWindow):
     def load_current(self):
         f = self.files[self.idx]
         self.lbl_path.setText(f"{human_relpath(self.root, os.path.dirname(f))}/{os.path.basename(f)}")
+
         y, sr = sf.read(f, dtype="float32", always_2d=False)
-        if y.ndim == 2:
+        if isinstance(y, np.ndarray) and y.ndim == 2:
             y = y.mean(axis=1)
-        self.y_raw = y.astype(np.float32)
+        self.y_raw = np.asarray(y, dtype=np.float32)
         self._filt_cache = None; self._filt_params = None
-        self.sr = int(sr); self.t = np.arange(len(self.y_raw), dtype=float) / self.sr # type: ignore
-        dur = len(self.y_raw)/self.sr # type: ignore
+        self.sr = int(sr); self.t = np.arange(len(self.y_raw), dtype=float) / self.sr  # type: ignore
+
+        dur = float(len(self.y_raw)) / float(self.sr) if len(self.y_raw) else 0.0
         self.time_slider.blockSignals(True); self.time_slider.setRange(0, int(dur*100)); self.time_slider.setValue(0); self.time_slider.blockSignals(False)
         self.lbl_time.setText("0.00 s"); self.playhead.setPos(0.0)
+
         js_path = json_sidecar_path(f)
         if os.path.isfile(js_path):
-            with open(js_path, "r", encoding="utf-8") as fh:
-                self.state = FileState.from_json(json.load(fh))
+            try:
+                with open(js_path, "r", encoding="utf-8") as fh:
+                    self.state = FileState.from_json(json.load(fh))
+            except Exception:
+                self.state = FileState(file=os.path.basename(f), sr=self.sr, meta=dict(self.session_meta), segments=[])
         else:
             self.state = FileState(file=os.path.basename(f), sr=self.sr, meta=dict(self.session_meta), segments=[])
+
+        # Merge defaults uit sessie, behoud per-file waarden
+        if not isinstance(self.state.meta, dict):
+            self.state.meta = {}
+        for k, v in (self.session_meta or {}).items():
+            self.state.meta.setdefault(k, v)
+
+        # Editor vullen met alleen de 6 velden
+        meta_for_editor = {k: self.state.meta.get(k, "") for k in METADATA_FIELDS}
+        self.meta_inline.set_values(meta_for_editor)
+
         self.draw_waveform(); self.update_spectrogram()
+
         self._blocking = True
-        init_len = min(3.0, float(len(self.y_raw))/self.sr) # type: ignore
+        init_len = min(3.0, dur) if dur > 0.0 else 0.0
         self.region.setRegion((0.0, init_len)); self.sel_start.setValue(0.0); self.sel_end.setValue(init_len); self.lbl_sel_delta.setText(f"(Δ {init_len:.2f} s)")
         self._blocking = False
+
         self.refresh_segment_list(); self.save_json()
 
     def draw_waveform(self):

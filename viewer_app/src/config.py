@@ -14,3 +14,12 @@ TIME_SNAP = 0.01
 DEBUG_STFT = False               # print debug info during STFT
 DYNAMIC_SPECTRO_LEVELS = False   # auto levels per spectrogram frame
 GRAYSCALE_DEBUG = True           # grayscale spectrogram (debug)
+
+METADATA_FIELDS = [
+    "subject_id",
+    "microphone_type",
+    "sample_rate",
+    "location",
+    "gender",
+    "age",
+]

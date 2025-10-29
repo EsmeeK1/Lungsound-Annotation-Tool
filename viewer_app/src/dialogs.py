@@ -63,34 +63,43 @@ class StartDialog(QtWidgets.QDialog):
         # Form layout for metadata fields
         form_meta = QtWidgets.QFormLayout()
 
-        # --- Gender field ---
-        self.gender = QtWidgets.QComboBox()
-        self.gender.addItems(["", "Male", "Female", "Unknown"])
-        self.gender.setToolTip(
-            "Optional. Only needed if you want to analyze by gender."
-        )
+        # Form layout voor metadata (alleen 6 velden in vaste volgorde)
+        form_meta = QtWidgets.QFormLayout()
 
-        # --- Age field ---
-        self.age = QtWidgets.QSpinBox()
-        self.age.setRange(0, 120)
-        self.age.setSpecialValueText("")       # Display empty when at minimum
-        self.age.setValue(self.age.minimum())  # Start empty
-        self.age.setToolTip(
-            "Optional. Leave blank if unknown or irrelevant for your analysis."
-        )
+        # 1) Subject ID
+        self.subject_id = QtWidgets.QLineEdit()
+        self.subject_id.setPlaceholderText("e.g. P0123")
+        form_meta.addRow("Subject ID:", self.subject_id)
 
-        # --- Recording location field ---
+        # 2) Microphone type
+        self.mic_type = QtWidgets.QLineEdit()
+        self.mic_type.setPlaceholderText("e.g. Plastic Membrane")
+        form_meta.addRow("Microphone type:", self.mic_type)
+
+        # 3) Sample Rate
+        self.sr_spin = QtWidgets.QSpinBox()
+        self.sr_spin.setRange(0, 384000)
+        self.sr_spin.setSingleStep(100)
+        self.sr_spin.setSpecialValueText("")  # leeg bij 0
+        form_meta.addRow("Sample Rate:", self.sr_spin)
+
+        # 4) Recording location
         self.location = QtWidgets.QLineEdit()
-        self.location.setToolTip(
-            "Recommended for lung sound recordings; sound type/intensity may vary by location."
-        )
-
-        # Add all metadata fields to the form layout
-        form_meta.addRow("Gender:", self.gender)
-        form_meta.addRow("Age:", self.age)
+        self.location.setPlaceholderText("e.g. LLL, RUL")
         form_meta.addRow("Recording location:", self.location)
 
-        # Add metadata form to the group box and then to the dialog
+        # 5) Gender
+        self.gender = QtWidgets.QComboBox()
+        self.gender.addItems(["", "Male", "Female", "Unknown"])
+        form_meta.addRow("Gender:", self.gender)
+
+        # 6) Age
+        self.age = QtWidgets.QSpinBox()
+        self.age.setRange(0, 120)
+        self.age.setSpecialValueText("")  # leeg bij 0
+        form_meta.addRow("Age:", self.age)
+
+        # Voeg het formulier toe
         grp_layout.addLayout(form_meta)
         v.addWidget(grp)
 
@@ -121,11 +130,13 @@ class StartDialog(QtWidgets.QDialog):
         and how they can be used in analysis.
         """
         txt = (
-            "Explanation of metadata fields:\n\n"
-            "• Gender: Optional; only needed if you want to analyze by gender.\n"
-            "• Age: Optional; leave blank if unknown or irrelevant.\n"
-            "• Recording location: Recommended for lung sounds; "
-            "sound characteristics may vary by location."
+            "Metadata fields are stored with each recording and used as defaults for new files:\n\n"
+            "• Subject ID – unique identifier for the participant\n"
+            "• Microphone type – sensor or stethoscope used\n"
+            "• Sample Rate – recording sampling frequency (Hz)\n"
+            "• Recording location – chest area or body position\n"
+            "• Gender – patient gender\n"
+            "• Age – patient age in years"
         )
         QtWidgets.QMessageBox.information(self, "Metadata Info", txt)
 
@@ -173,6 +184,9 @@ class StartDialog(QtWidgets.QDialog):
         g = self.gender.currentText().strip()
         a = self.age.value()
         loc = self.location.text().strip()
+        sid = self.subject_id.text().strip()
+        mic = self.mic_type.text().strip()
+        sr  = int(self.sr_spin.value())
 
         # Add non-empty fields to metadata dictionary
         if g:
@@ -182,6 +196,9 @@ class StartDialog(QtWidgets.QDialog):
         if loc:
             meta["location"] = loc
 
+        if sid: meta["subject_id"] = sid
+        if mic: meta["microphone_type"] = mic
+        if sr > 0: meta["sample_rate"] = sr
         return meta
 
 class AutoSegmentDialog(QtWidgets.QDialog):
