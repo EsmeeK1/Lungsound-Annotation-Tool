@@ -9,8 +9,6 @@
     "Knetter (Crackle)"
   ],
   "meta_defaults": {
-    "gender": "",
-    "age": "",
     "location": ""
   },
   "filter_defaults": {
@@ -27,6 +25,6 @@
   "auto_segment_defaults": {
     "length_s": 3.0,
     "overlap_s": 0.0,
-    "label": "Hoest"
+    "label": "Normal"
   }
 }
