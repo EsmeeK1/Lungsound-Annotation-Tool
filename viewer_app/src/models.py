@@ -1,5 +1,19 @@
 from dataclasses import dataclass, asdict, field
-from typing import List, Dict, Optional
+import re
+from typing import Optional, Dict, Any, List
+
+SUBJECT_PATTERNS = [
+    re.compile(r"^\d{3}$"),        # 001
+    re.compile(r"^P\d{3}$"),       # P001
+]
+
+def normalize_subject_id(text: str) -> str:
+    t = text.strip().upper()
+    if SUBJECT_PATTERNS[0].match(t):   # 001
+        return t
+    if SUBJECT_PATTERNS[1].match(t):   # P001
+        return t
+    raise ValueError("Subject ID moet '001' of 'P001' zijn (3 cijfers, optionele 'P' prefix).")
 
 @dataclass
 class Segment:
@@ -30,3 +44,33 @@ class FileState:
         for s in d.get("segments", []):
             fs.segments.append(Segment(**s))
         return fs
+
+@dataclass
+class MetadataV2:
+    schema_version: int = 2
+    subject_id: Optional[str] = None
+    mic_type: Optional[str] = None
+    location: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "MetadataV2":
+        ver = d.get("schema_version", 1)
+        if ver == 1:
+            # migrate v1 → v2 (drop gender/age)
+            return cls(
+                subject_id=d.get("subject_id"),
+                mic_type=d.get("mic_type"),
+                location=d.get("location"),
+            )
+        return cls(
+            subject_id=d.get("subject_id"),
+            mic_type=d.get("mic_type"),
+            location=d.get("location"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def validate(self) -> None:
+        if self.subject_id:
+            self.subject_id = normalize_subject_id(self.subject_id)

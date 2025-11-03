@@ -227,6 +227,16 @@ class Player(QtCore.QObject):
         self.playing = True  # Update state
         self.started.emit(t0, t1)  # Notify others that playback has started
 
+    def play_region(self, y: np.ndarray, sr: int, t_start: float, t_end: float):
+        """
+        Play a region from the provided audio buffer `y` sampled at `sr` between t_start and t_end.
+        This avoids relying on an undefined `_backend` attribute and reuses the existing `play` method.
+        """
+        t_start = max(0.0, float(t_start))
+        t_end = max(t_start, float(t_end))
+        # Use the existing play method which slices and plays the provided buffer.
+        self.play(y, sr, t_start, t_end)
+
     def stop(self):
         """
         Stop playback and close the audio stream safely.

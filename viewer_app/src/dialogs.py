@@ -1,4 +1,4 @@
-from PySide6 import QtWidgets, QtCore
+from PySide6 import QtWidgets, QtCore, QtGui
 from .config import TIME_SNAP
 from .utils import labels_dataset_path
 from typing import List, Dict, Optional, Tuple
@@ -9,13 +9,11 @@ class StartDialog(QtWidgets.QDialog):
 
     This dialog allows the user to:
       - Select the root folder containing the dataset.
-      - Optionally enter metadata such as gender, age, and recording location.
+      - Optionally enter metadata such as recording location.
 
     Attributes:
         btn_choose (QtWidgets.QPushButton): Button to open folder picker.
         le_root (QtWidgets.QLineEdit): Read-only field showing chosen folder path.
-        gender (QtWidgets.QComboBox): Dropdown for selecting gender.
-        age (QtWidgets.QSpinBox): Field for entering age (0–120).
         location (QtWidgets.QLineEdit): Field for entering recording location.
         btn_info (QtWidgets.QToolButton): Info button that shows metadata field explanations.
         _btn_ok (QtWidgets.QPushButton): OK button (enabled only after a folder is chosen).
@@ -68,11 +66,13 @@ class StartDialog(QtWidgets.QDialog):
 
         # 1) Subject ID
         self.subject_id = QtWidgets.QLineEdit()
-        self.subject_id.setPlaceholderText("e.g. P0123")
+        self.subject_id.setPlaceholderText("001 of P001")
+        self.subject_id.setValidator(QtGui.QRegularExpressionValidator(QtCore.QRegularExpression(r"^(P?\d{3})$")))
         form_meta.addRow("Subject ID:", self.subject_id)
 
-        # 2) Microphone type
-        self.mic_type = QtWidgets.QLineEdit()
+        # 2) Microphone type (editable combobox)
+        self.mic_type = QtWidgets.QComboBox(); self.mic_type.setEditable(True)
+        self.mic_type.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.InsertAlphabetically)
         self.mic_type.setPlaceholderText("e.g. Plastic Membrane")
         form_meta.addRow("Microphone type:", self.mic_type)
 
@@ -83,21 +83,11 @@ class StartDialog(QtWidgets.QDialog):
         self.sr_spin.setSpecialValueText("")  # leeg bij 0
         form_meta.addRow("Sample Rate:", self.sr_spin)
 
-        # 4) Recording location
-        self.location = QtWidgets.QLineEdit()
+        # 4) Recording location (editable combobox)
+        self.location = QtWidgets.QComboBox(); self.location.setEditable(True)
+        self.location.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.InsertAlphabetically)
         self.location.setPlaceholderText("e.g. LLL, RUL")
         form_meta.addRow("Recording location:", self.location)
-
-        # 5) Gender
-        self.gender = QtWidgets.QComboBox()
-        self.gender.addItems(["", "Male", "Female", "Unknown"])
-        form_meta.addRow("Gender:", self.gender)
-
-        # 6) Age
-        self.age = QtWidgets.QSpinBox()
-        self.age.setRange(0, 120)
-        self.age.setSpecialValueText("")  # leeg bij 0
-        form_meta.addRow("Age:", self.age)
 
         # Voeg het formulier toe
         grp_layout.addLayout(form_meta)
@@ -135,8 +125,6 @@ class StartDialog(QtWidgets.QDialog):
             "• Microphone type – sensor or stethoscope used\n"
             "• Sample Rate – recording sampling frequency (Hz)\n"
             "• Recording location – chest area or body position\n"
-            "• Gender – patient gender\n"
-            "• Age – patient age in years"
         )
         QtWidgets.QMessageBox.information(self, "Metadata Info", txt)
 
@@ -176,28 +164,19 @@ class StartDialog(QtWidgets.QDialog):
 
         Returns:
             dict: A dictionary with any filled metadata fields.
-                  Example: {"gender": "Male", "age": 32, "location": "Basal left"}
         """
         meta = {}
 
         # Get current field values
-        g = self.gender.currentText().strip()
-        a = self.age.value()
-        loc = self.location.text().strip()
+        meta: Dict[str, object] = {}
         sid = self.subject_id.text().strip()
-        mic = self.mic_type.text().strip()
+        mic = self.mic_type.currentText().strip()
+        loc = self.location.currentText().strip()
         sr  = int(self.sr_spin.value())
-
-        # Add non-empty fields to metadata dictionary
-        if g:
-            meta["gender"] = g
-        if a > 0:
-            meta["age"] = int(a)
-        if loc:
-            meta["location"] = loc
 
         if sid: meta["subject_id"] = sid
         if mic: meta["microphone_type"] = mic
+        if loc: meta["location"] = loc
         if sr > 0: meta["sample_rate"] = sr
         return meta
 

@@ -1,5 +1,5 @@
 import os, uuid, json, datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable
 
 import numpy as np
 import pandas as pd
@@ -7,12 +7,12 @@ import soundfile as sf
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from .config import DEFAULT_SR, TIME_SNAP, LABELS_JSON_PATH, DEBUG_STFT, DYNAMIC_SPECTRO_LEVELS, GRAYSCALE_DEBUG, METADATA_FIELDS
-from .models import Segment, FileState
+from .config import DEFAULT_SR, TIME_SNAP, DEBUG_STFT, DYNAMIC_SPECTRO_LEVELS, GRAYSCALE_DEBUG, METADATA_FIELDS, LABEL_SETS, DEFAULT_LABEL_SET, load_prefs, save_prefs, labels_list_to_dict, load_default_locations, UserPrefs
+from .models import Segment, FileState, normalize_subject_id
 from .utils import snap_t, human_relpath, json_sidecar_path, csv_path_for_root, labels_dataset_path, ensure_dir, LABEL_COLORS
 from .audio import bandpass_filter, compute_stft_db, Player
 from .dialogs import StartDialog, AutoSegmentDialog
-from .widgets import ClickableRegion, MetadataInlineEditor
+from .widgets import ClickableRegion, MetadataInlineEditor, LabelBar
 
 def _dbg(msg: str):
     if DEBUG_STFT:
@@ -31,7 +31,9 @@ class App(QtWidgets.QMainWindow):
         self.act_open = m.addAction("Map openen…")
         self.act_open.triggered.connect(self.open_folder_dialog)
 
+        self._custom_labels: Optional[list[str]] = None
         self.player = Player()
+        self.prefs: UserPrefs = load_prefs()
         self.root = ""
         self.files: List[str] = []
         self.idx = -1
@@ -90,21 +92,61 @@ class App(QtWidgets.QMainWindow):
 
         rv.addLayout(sel_row)
 
-        # Voeg direct daarna toe:
         self.meta_inline = MetadataInlineEditor(METADATA_FIELDS, parent=right)
+        self.meta_inline.set_recent_mics(self.prefs.recents_mic_types)
+        self.meta_inline.set_recent_locations(self.prefs.recents_locations)
         rv.addWidget(self.meta_inline)
         self.meta_inline.changed.connect(self._on_meta_inline_changed)
 
+        def _apply_labelset(name: str):
+            from .config import LABEL_SETS, labels_list_to_dict
+
+            # Zorg dat custom altijd geladen is
+            if name.lower().startswith("custom"):
+                if not self._custom_labels:
+                    # probeer opnieuw labels_dataset.json te laden
+                    self.load_labels_json()
+
+                if self._custom_labels:
+                    self.labelbar.set_labels(labels_list_to_dict(self._custom_labels))
+                else:
+                    # fallback: toon iets i.p.v. leeg veld
+                    self.labelbar.set_labels({"No labels loaded": "Edit labels_dataset.json and reload"})
+            else:
+                labels = LABEL_SETS.get(name, {})
+                self.labelbar.set_labels(labels if labels else {"No labels": "Empty label set"})
+
+            # altijd even de metadata dropdown updaten
+            self._refresh_location_choices()
+
+        # --- Labelset + LabelBar -------------------------------------------------
+        label_row = QtWidgets.QHBoxLayout()
+        lbl_labelset = QtWidgets.QLabel("Label set")
+
+        self.btn_label_info = QtWidgets.QToolButton()
+        self.btn_label_info.setText("Info")
+        self.btn_label_info.setToolTip("How to use the label sets")
+        self.btn_label_info.clicked.connect(self._show_label_info)
+
+        label_row.addWidget(lbl_labelset)
+        label_row.addStretch(1)
+        label_row.addWidget(self.btn_label_info)
+        rv.addLayout(label_row)
+
+        self.labelset_combo = QtWidgets.QComboBox()
+        self.labelbar = LabelBar({})
+        rv.addWidget(self.labelset_combo)
+        rv.addWidget(self.labelbar)
+
+        self.labelset_combo.currentTextChanged.connect(
+            lambda name: self.labelbar.set_labels(LABEL_SETS.get(name, {}))
+        )
+        self.labelset_combo.currentTextChanged.connect(lambda _: self._refresh_location_choices())
+        self.labelbar.toggled.connect(self._on_labelbar_toggled)
+        # -------------------------------------------------------------------------
+
         self.sel_start.valueChanged.connect(lambda _: self.on_sel_spin_changed())
         self.sel_end.valueChanged.connect(lambda _: self.on_sel_spin_changed())
-
-        box = QtWidgets.QGroupBox("Labels"); vb = QtWidgets.QVBoxLayout(box)
-        self.combo_labels = QtWidgets.QComboBox()
-        hb = QtWidgets.QHBoxLayout(); self.txt_new_label = QtWidgets.QLineEdit(); self.txt_new_label.setPlaceholderText("Nieuw label…")
-        self.btn_add_label = QtWidgets.QPushButton("Add label to selection")
-        self.btn_reload_labels = QtWidgets.QPushButton("Herlaad labels.json")
-        vb.addWidget(self.combo_labels); hb.addWidget(self.txt_new_label); vb.addLayout(hb); vb.addWidget(self.btn_add_label); vb.addWidget(self.btn_reload_labels)
-        rv.addWidget(box)
 
         self.btn_auto_seg = QtWidgets.QPushButton("Auto segment…"); rv.addWidget(self.btn_auto_seg); self.btn_auto_seg.clicked.connect(self.auto_segment_dialog)
 
@@ -150,6 +192,10 @@ class App(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Enter"),  self, self.update_segment)
         QtGui.QShortcut(QtGui.QKeySequence("Delete"), self, self.delete_selected)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.reset_view)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self, self.undo)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Y"), self, self.redo)
+        self._undo_stack: List[Tuple[Callable[[], None], Callable[[], None]]] = []
+        self._redo_stack: List[Tuple[Callable[[], None], Callable[[], None]]] = []
 
         for seq, cb in [
             ("Left",        lambda: self.nudge_region(-TIME_SNAP, "move")),
@@ -166,8 +212,6 @@ class App(QtWidgets.QMainWindow):
         self.btn_prev.clicked.connect(lambda: self.advance(-1))
         self.btn_next.clicked.connect(lambda: self.advance(+1))
         self.btn_open_folder.clicked.connect(self.open_folder_dialog)
-        self.btn_add_label.clicked.connect(self.add_label_to_selection)
-        self.txt_new_label.returnPressed.connect(self.add_label_to_selection)
         self.btn_remove_label.clicked.connect(self.remove_selected_label)
         self.region.sigRegionChanged.connect(self.on_region_changed)
         self.list.currentRowChanged.connect(self.on_list_selection)
@@ -175,7 +219,7 @@ class App(QtWidgets.QMainWindow):
         self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_export_csv.clicked.connect(self.export_csv)
         self.time_slider.valueChanged.connect(self.on_slider_changed)
-        self.btn_reload_labels.clicked.connect(self.reload_labels_json)
+        self.list.itemDoubleClicked.connect(lambda *_: self._play_current_segment())
 
         self.player.started.connect(self.on_play_started)
         self.player.stopped.connect(self.on_play_stopped)
@@ -200,7 +244,7 @@ class App(QtWidgets.QMainWindow):
     def _show_bp_info(self):
         txt = (
             "Short explanation about bandpass filtering:\n\n"
-            "• Lung focus (80-3000 Hz): suppresses low hearttones and captures the higher energy of many lung sounds.\n"
+            "• Lung focus (80-3000 Hz): suppresses low hearttones and captures the higher energy of many Lung sounds.\n"
             "• Heart focus (20-250 Hz): focuses on S1/S2 and low-frequency components; murmurs may be slightly higher.\n\n"
             "• Order (4-6 recommended): higher order = steeper edges, but more risk of ringing/instability.\n"
             "  Order 4 is a safe and stable choice.\n"
@@ -208,6 +252,20 @@ class App(QtWidgets.QMainWindow):
             "  Use ‘on’ for offline analysis/visualization; ‘off’ for real-time chains with minimal latency.\n"
         )
         QtWidgets.QMessageBox.information(self, "Bandpass – Info", txt)
+
+    def _show_label_info(self):
+        txt = (
+            "<b>How the Label Set works:</b><br><br>"
+            "• <b>Custom</b> — your own labels loaded from <code>labels_dataset.json</code>. "
+            "Use this for experiments or non-clinical recordings (e.g., coughs, tracheal sounds).<br><br>"
+            "• <b>Lung</b> — predefined clinical categories for respiratory sounds "
+            "(crackles, wheezes, rhonchi, etc.).<br>"
+            "• <b>Heart</b> — predefined cardiac sound types (S1, S2, murmurs, clicks, gallops).<br><br>"
+            "Click a button below to add or remove that label on the current segment. "
+            "The button stays highlighted while the segment contains that label. "
+            "You can switch label sets at any time; it won't delete existing annotations."
+        )
+        QtWidgets.QMessageBox.information(self, "Label Set Info", txt)
 
     def init_spectrogram(self, grid_layout: QtWidgets.QGridLayout):
         self.p_spec = pg.PlotWidget()
@@ -257,35 +315,6 @@ class App(QtWidgets.QMainWindow):
         if not np.any(mask):
             mask = f <= f[-1]
         f_plot = f[mask]; img = S_db[mask, :]
-
-        if GRAYSCALE_DEBUG:
-            finite = np.isfinite(img)
-            if finite.any():
-                vmin = float(np.percentile(img[finite], 5))
-                vmax = float(np.percentile(img[finite], 99))
-                if vmin >= vmax: vmin, vmax = -100.0, 0.0
-            else:
-                vmin, vmax = -100.0, 0.0
-            im8 = (255.0 * np.clip((img - vmin) / (vmax - vmin + 1e-12), 0.0, 1.0)).astype(np.uint8)
-            self.img_spec.setLookupTable(None); self.img_spec.setLevels((0, 255)); self.img_spec.setImage(im8, autoLevels=False)
-        else:
-            try:
-                lut = pg.colormap.get("inferno").getLookupTable(256) # type: ignore
-                self.img_spec.setLookupTable(lut)
-            except Exception:
-                self.img_spec.setLookupTable(None)
-            if DYNAMIC_SPECTRO_LEVELS:
-                finite = np.isfinite(img)
-                if finite.any():
-                    vmin = float(np.percentile(img[finite], 5))
-                    vmax = float(np.percentile(img[finite], 99))
-                    if vmin >= vmax: vmin, vmax = -100.0, 0.0
-                else:
-                    vmin, vmax = -100.0, 0.0
-                self.img_spec.setLevels((vmin, vmax))
-            else:
-                self.img_spec.setLevels((-100.0, 0.0))
-            self.img_spec.setImage(img, autoLevels=False)
 
         if len(t) > 1 and len(f_plot) > 1:
             t_max = float(t[-1]); f_max = float(f_plot[-1])
@@ -427,9 +456,20 @@ class App(QtWidgets.QMainWindow):
     def _on_meta_inline_changed(self, values: dict):
         if not self.state:
             return
+        vals = dict(values or {})
+        # Normaliseer subject_id indien aanwezig
+        sid = vals.get("subject_id", "")
+        if sid:
+            try:
+                vals["subject_id"] = normalize_subject_id(str(sid))
+            except Exception:
+                # laat ongewijzigd in UI; validatie gebeurt al in widget
+                pass
         self.state.meta = dict(self.state.meta or {})
-        self.state.meta.update(values or {})
+        self.state.meta.update(vals)
         self.save_json()
+        # recents
+        self.bump_recents(vals.get("microphone_type"), vals.get("location"))
 
     def refresh_segment_list(self):
         self.list.clear()
@@ -443,6 +483,7 @@ class App(QtWidgets.QMainWindow):
             self.list.addItem(f"{s.t_start:.2f}-{s.t_end:.2f}s | {'; '.join(s.labels) or '(geen labels)'}")
             reg = ClickableRegion([s.t_start, s.t_end], brush=self._brush_for_labels(s.labels), seg_id=s.id)
             self.p_wave.addItem(reg); reg.clicked.connect(self.on_overlay_clicked); self.overlay_regions[s.id] = reg
+        self._reflect_labelbar()
 
     def _find_segment_by_bounds(self, a: float, b: float) -> Optional[Segment]:
         if not self.state: return None
@@ -450,26 +491,6 @@ class App(QtWidgets.QMainWindow):
             if abs(s.t_start - a) < 1e-6 and abs(s.t_end - b) < 1e-6:
                 return s
         return None
-
-    def add_label_to_selection(self):
-        if not self.state: return
-        entered = self.txt_new_label.text().strip()
-        if entered:
-            if self.combo_labels.findText(entered) < 0:
-                self.combo_labels.addItem(entered)
-                self.add_label_to_dataset(entered)
-            label = entered; self.txt_new_label.clear()
-        else:
-            label = self.combo_labels.currentText()
-        a, b = self.region.getRegion(); a = snap_t(a); b = max(a+TIME_SNAP, snap_t(b)) # type: ignore
-        seg = self._find_segment_by_bounds(a, b)
-        if seg is None:
-            import uuid
-            seg = Segment(id=str(uuid.uuid4()), t_start=a, t_end=b, labels=[])
-            self.state.segments.append(seg)
-        if label not in seg.labels:
-            seg.labels.append(label)
-        self.refresh_segment_list(); self.list.setCurrentRow(self.state.segments.index(seg)); self.save_json(); self.rebuild_label_list()
 
     def on_list_selection(self, row: int):
         if not self.state or row < 0 or row >= len(self.state.segments):
@@ -481,6 +502,7 @@ class App(QtWidgets.QMainWindow):
         self.region.setRegion((s.t_start, s.t_end))
         self.sel_start.setValue(s.t_start); self.sel_end.setValue(s.t_end); self.lbl_sel_delta.setText(f"(Δ {(s.t_end - s.t_start):.2f} s)")
         self._blocking = False
+        self._reflect_labelbar()
 
     def remove_selected_label(self):
         row = self.list.currentRow()
@@ -547,13 +569,16 @@ class App(QtWidgets.QMainWindow):
             except Exception:
                 continue
             for s in st.segments:
-                rows.append({
-                    "date": today,
-                    "filename": self._rel_display_name(fp),
-                    "t_start": s.t_start, "t_end": s.t_end,
-                    "label": ";".join(s.labels),
-                    "gender": st.meta.get("gender", ""), "age": st.meta.get("age", ""), "location": st.meta.get("location", ""),
-                })
+                    rows.append({
+                        "date": today,
+                        "filename": self._rel_display_name(fp),
+                        "t_start": s.t_start, "t_end": s.t_end,
+                        "label": ";".join(s.labels),
+                        "subject_id": st.meta.get("subject_id", ""),
+                        "microphone_type": st.meta.get("microphone_type", ""),
+                        "sample_rate": st.meta.get("sample_rate", ""),
+                        "location": st.meta.get("location", ""),
+                    })
         if not rows:
             QtWidgets.QMessageBox.information(self, "Export", "Geen segmenten om te exporteren."); return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export CSV", csv_path_for_root(self.root), "CSV (*.csv)")
@@ -561,16 +586,52 @@ class App(QtWidgets.QMainWindow):
         pd.DataFrame(rows).to_csv(path, index=False)
         QtWidgets.QMessageBox.information(self, "Export", f"Opgeslagen {len(rows)} rijen naar:\n{path}")
 
+    def bump_recents(self, mic: str | None = None, loc: str | None = None):
+        changed = False
+        if mic:
+            if mic in self.prefs.recents_mic_types:
+                self.prefs.recents_mic_types.remove(mic)
+            self.prefs.recents_mic_types.append(mic)
+            self.prefs.recents_mic_types = self.prefs.recents_mic_types[-8:]
+            changed = True
+        if loc:
+            if loc in self.prefs.recents_locations:
+                self.prefs.recents_locations.remove(loc)
+            self.prefs.recents_locations.append(loc)
+            self.prefs.recents_locations = self.prefs.recents_locations[-8:]
+            changed = True
+        if changed:
+            save_prefs(self.prefs)
+            # Mic: gewoon recents
+            self.meta_inline.set_recent_mics(self.prefs.recents_mic_types)
+            defaults = load_default_locations(self.labelset_combo.currentText())
+            merged = list(dict.fromkeys(defaults + self.prefs.recents_locations))
+            self.meta_inline.set_recent_locations(merged)
+
+    def _refresh_location_choices(self):
+        # haal defaults voor huidige labelset
+        defaults = load_default_locations(self.labelset_combo.currentText())
+        # voeg je 'recents' toe, zonder dubbels (defaults eerst)
+        merged = list(dict.fromkeys(defaults + self.prefs.recents_locations))
+        # zet ze in de MetadataInlineEditor combobox
+        self.meta_inline.set_recent_locations(merged)
+
     def load_labels_json(self):
+        """
+        Leest labels_dataset.json en zet:
+        - self._custom_labels : Optional[List[str]]
+        - STFT/filter/auto-segment defaults (zoals voorheen)
+        Laat de LabelBar invullen door _refresh_labelset_combo().
+        """
         path = labels_dataset_path()
         default_cfg = {
             "version": 1,
             "updated": datetime.datetime.now().isoformat(timespec="seconds"),
-            "labels": ["Hoest","Normaal","Hartslag","Piep (Wheeze)","Knetter (Crackle)"],
-            "meta_defaults": {"gender":"","age":"","location":""},
+            "labels": [],  # <— standaard leeg: 'custom' wordt dan niet getoond
+            "meta_defaults": {"location":""},
             "filter_defaults": {"lowcut": 50, "highcut": 3000, "order": 4, "zero_phase": True},
             "stft_params": {"nperseg": 1024, "hop": 256, "window": "hann"},
-            "auto_segment_defaults": {"length_s": 3.00, "overlap_s": 0.00, "label": "Hoest"}
+            "auto_segment_defaults": {"length_s": 3.00, "overlap_s": 0.00, "label": ""}
         }
         from pathlib import Path
         if Path(path).is_file():
@@ -584,21 +645,54 @@ class App(QtWidgets.QMainWindow):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(default_cfg, f, ensure_ascii=False, indent=2)
 
-        labels = cfg.get("labels", [])
-        self.combo_labels.clear()
-        if labels:
-            self.combo_labels.addItems(labels)
-        LABEL_COLORS.build(labels)
+        # 1) labels.json → custom labels
+        labels = cfg.get("labels", []) or []
+        self._custom_labels = list(labels) if labels else None
+
+        # 2) kleuren opbouwen (optioneel; blijft werken)
+        LABEL_COLORS.build(labels if labels else [])
+
+        # 3) meta/filter/stft/auto-seg defaults (zoals je had)
         defaults = cfg.get("meta_defaults", {})
         for k, v in defaults.items():
             self.session_meta.setdefault(k, v)
+
         fdef = cfg.get("filter_defaults", {})
         if "lowcut" in fdef:     self.sp_low.setValue(float(fdef["lowcut"]))
         if "highcut" in fdef:    self.sp_high.setValue(float(fdef["highcut"]))
         if "order" in fdef:      self.sp_order.setValue(int(fdef["order"]))
         if "zero_phase" in fdef: self.chk_zero.setChecked(bool(fdef["zero_phase"]))
+
         self._stft_cfg     = cfg.get("stft_params", {"nperseg":1024,"hop":256,"window":"hann"})
-        self._auto_seg_cfg = cfg.get("auto_segment_defaults", {"length_s":3.0,"overlap_s":0.0,"label":labels[0] if labels else ""})
+        self._auto_seg_cfg = cfg.get("auto_segment_defaults", {"length_s":3.0,"overlap_s":0.0,"label": (labels[0] if labels else "")})
+
+        # 4) combobox + labelbar updaten
+        self._refresh_labelset_combo()
+        self._refresh_location_choices()
+
+    def _refresh_labelset_combo(self):
+        """
+        Bouw de lijst: [Custom] + ['Lung','Heart'].
+        Selecteer 'custom' als die bestaat, anders DEFAULT_LABEL_SET.
+        """
+
+        items = []
+        if self._custom_labels:
+            items.append("Custom")
+        items.extend(LABEL_SETS.keys())
+
+        self.labelset_combo.blockSignals(True)
+        self.labelset_combo.clear()
+        self.labelset_combo.addItems(items)
+        # kies default
+        if "Custom" in items:
+            self.labelset_combo.setCurrentText("Custom")
+            self.labelbar.set_labels(labels_list_to_dict(self._custom_labels))  # type: ignore
+        else:
+            self.labelset_combo.setCurrentText(DEFAULT_LABEL_SET)
+            self.labelbar.set_labels(LABEL_SETS[DEFAULT_LABEL_SET])
+        self.labelset_combo.blockSignals(False)
+
 
     def add_label_to_dataset(self, label: str):
         path = labels_dataset_path()
@@ -654,6 +748,106 @@ class App(QtWidgets.QMainWindow):
         if new < 0 or new >= len(self.files): return
         self.idx = new; self.load_current(); self._after_navigation_changed()
 
+    # -------- Undo/Redo helpers ----------------------------------------------
+    def _push_edit(self, do: Callable[[], None], undo: Callable[[], None]):
+        do()
+        self._undo_stack.append((do, undo))
+        self._redo_stack.clear()
+        self._post_edit_refresh()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        do, undo = self._undo_stack.pop()
+        undo()
+        self._redo_stack.append((do, undo))
+        self._post_edit_refresh()
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        do, undo = self._redo_stack.pop()
+        do()
+        self._undo_stack.append((do, undo))
+        self._post_edit_refresh()
+
+    def _post_edit_refresh(self):
+        self.refresh_segment_list()
+        self._reflect_labelbar()
+        self.save_json()
+    # -------------------------------------------------------------------------
+
+
+    # -------- Labelbar / segment helpers -------------------------------------
+    def _current_segment_or_none(self) -> Optional[Segment]:
+        if not self.state:
+            return None
+        row = self.list.currentRow()
+        if 0 <= row < len(self.state.segments):
+            return self.state.segments[row]
+        return None
+
+    def _create_segment(self, t_start: float, t_end: float) -> Segment:
+        seg = Segment(id=str(uuid.uuid4()), t_start=t_start, t_end=t_end, labels=[])
+        if self.state:
+            self.state.segments.append(seg)
+        return seg
+
+    def _reflect_labelbar(self):
+        # update knoppen-checked toestand op basis van huidig segment
+        seg = self._current_segment_or_none()
+        self.labelbar.reflect_segment(seg.labels if seg else [])
+
+    def _on_labelbar_toggled(self, label: str, checked: bool):
+        if not self.state:
+            return
+
+        seg = self._current_segment_or_none()
+        if seg is None:
+            # geen huidig segment -> maak er een uit de huidige selectie
+            a, b = self.region.getRegion()
+            a = snap_t(a); b = max(a + TIME_SNAP, snap_t(b))  # type: ignore
+            seg = self._create_segment(a, b)
+            self.list.setCurrentRow(len(self.state.segments) - 1)
+
+        def do_add():
+            if label not in seg.labels:
+                seg.labels.append(label)
+
+        def undo_add():
+            try:
+                seg.labels.remove(label)
+            except ValueError:
+                pass
+
+        def do_remove():
+            try:
+                seg.labels.remove(label)
+            except ValueError:
+                pass
+
+        def undo_remove():
+            if label not in seg.labels:
+                seg.labels.append(label)
+
+        if checked:
+            self._push_edit(do_add, undo_add)
+        else:
+            self._push_edit(do_remove, undo_remove)
+    # -------------------------------------------------------------------------
+
+
+    # -------- Play-per-segment ------------------------------------------------
+    def _play_current_segment(self):
+        if not self.state or self.y_raw is None:
+            return
+        seg = self._current_segment_or_none()
+        if not seg:
+            return
+        self.player.stop()
+        self.player.play(self.current_signal(), self.sr, float(seg.t_start), float(seg.t_end))
+    # -------------------------------------------------------------------------
+
     def open_folder_dialog(self, first=False):
         self.player.stop()
         dlg = StartDialog(self)
@@ -661,6 +855,10 @@ class App(QtWidgets.QMainWindow):
             return
         self.root = dlg.root or ""
         self.session_meta = dlg.get_meta()
+        mic = self.session_meta.get("microphone_type", "")
+        loc = self.session_meta.get("location", "")
+        if mic: self.bump_recents(mic=mic) # type: ignore
+        if loc: self.bump_recents(loc=loc) # type: ignore
         self.load_labels_json()
         self.build_file_queue(self.root)
         if not self.files:
@@ -715,9 +913,11 @@ class App(QtWidgets.QMainWindow):
         for k, v in (self.session_meta or {}).items():
             self.state.meta.setdefault(k, v)
 
-        # Editor vullen met alleen de 6 velden
+        # editor met 4 velden
         meta_for_editor = {k: self.state.meta.get(k, "") for k in METADATA_FIELDS}
         self.meta_inline.set_values(meta_for_editor)
+        self._refresh_location_choices()
+        _apply_labelset(self.labelset_combo.currentText())
 
         self.draw_waveform(); self.update_spectrogram()
 
@@ -776,11 +976,20 @@ class App(QtWidgets.QMainWindow):
         self._filt_cache = y_f.astype(np.float32, copy=False); self._filt_params = params
         return self._filt_cache
 
+    def _current_label_options(self) -> list[str]:
+        # Huidige bron van de LabelBar
+        name = self.labelset_combo.currentText()
+        if name == "Custom" and self._custom_labels:
+            return list(self._custom_labels)
+        from .config import LABEL_SETS
+        return list(LABEL_SETS.get(name, {}).keys())
+
+
     def auto_segment_dialog(self):
         if self.t is None or len(self.t) == 0:
             QtWidgets.QMessageBox.information(self, "Auto segmenteren", "Geen audio geladen."); return
-        label_options = [self.combo_labels.itemText(i) for i in range(self.combo_labels.count())]
-        default_label = getattr(self, "_auto_seg_cfg", {}).get("label", self.combo_labels.currentText() if self.combo_labels.count() else None)
+        label_options = self._current_label_options()
+        default_label = getattr(self, "_auto_seg_cfg", {}).get("label", (label_options[0] if label_options else None))
         default_len   = float(getattr(self, "_auto_seg_cfg", {}).get("length_s", 3.0))
         default_ovl   = float(getattr(self, "_auto_seg_cfg", {}).get("overlap_s", 0.0))
         dlg = AutoSegmentDialog(self, default_len=default_len, default_overlap=default_ovl, default_replace=False, label_options=label_options, default_label=default_label)
