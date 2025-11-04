@@ -6,6 +6,14 @@ import pandas as pd
 import soundfile as sf
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
+pg.setConfigOptions(imageAxisOrder='row-major', antialias=False, useOpenGL=False, useNumba=False)
+
+# extra failsafes
+pg.setConfigOptions(useNumba=False)
+try:
+    pg.setConfigOptions(useCupy=False)
+except Exception:
+    pass
 
 from .config import DEFAULT_SR, TIME_SNAP, DEBUG_STFT, DYNAMIC_SPECTRO_LEVELS, GRAYSCALE_DEBUG, METADATA_FIELDS, LABEL_SETS, DEFAULT_LABEL_SET, load_prefs, save_prefs, labels_list_to_dict, load_default_locations, UserPrefs
 from .models import Segment, FileState, normalize_subject_id
@@ -98,27 +106,6 @@ class App(QtWidgets.QMainWindow):
         rv.addWidget(self.meta_inline)
         self.meta_inline.changed.connect(self._on_meta_inline_changed)
 
-        def _apply_labelset(name: str):
-            from .config import LABEL_SETS, labels_list_to_dict
-
-            # Zorg dat custom altijd geladen is
-            if name.lower().startswith("custom"):
-                if not self._custom_labels:
-                    # probeer opnieuw labels_dataset.json te laden
-                    self.load_labels_json()
-
-                if self._custom_labels:
-                    self.labelbar.set_labels(labels_list_to_dict(self._custom_labels))
-                else:
-                    # fallback: toon iets i.p.v. leeg veld
-                    self.labelbar.set_labels({"No labels loaded": "Edit labels_dataset.json and reload"})
-            else:
-                labels = LABEL_SETS.get(name, {})
-                self.labelbar.set_labels(labels if labels else {"No labels": "Empty label set"})
-
-            # altijd even de metadata dropdown updaten
-            self._refresh_location_choices()
-
         # --- Labelset + LabelBar -------------------------------------------------
         label_row = QtWidgets.QHBoxLayout()
         lbl_labelset = QtWidgets.QLabel("Label set")
@@ -138,10 +125,7 @@ class App(QtWidgets.QMainWindow):
         rv.addWidget(self.labelset_combo)
         rv.addWidget(self.labelbar)
 
-        self.labelset_combo.currentTextChanged.connect(
-            lambda name: self.labelbar.set_labels(LABEL_SETS.get(name, {}))
-        )
-        self.labelset_combo.currentTextChanged.connect(lambda _: self._refresh_location_choices())
+        self.labelset_combo.currentTextChanged.connect(self._apply_labelset)
         self.labelbar.toggled.connect(self._on_labelbar_toggled)
         # -------------------------------------------------------------------------
 
@@ -267,7 +251,25 @@ class App(QtWidgets.QMainWindow):
         )
         QtWidgets.QMessageBox.information(self, "Label Set Info", txt)
 
+    def _ensure_spec_imageitem(self):
+        """Garandeer dat self.img_spec een geldige (minimaal 1x1) image heeft."""
+        try:
+            if getattr(self, "img_spec", None) is None:
+                return  # wordt in init_spectrogram gemaakt
+            # Als width/height None zijn, zet een 1x1 image
+            if self.img_spec.image is None:
+                self.img_spec.setImage(np.zeros((1, 1), dtype=np.float32), autoLevels=True)
+                self.img_spec.setRect(QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
+        except Exception:
+            # Worst case: still no image; force a tiny one
+            try:
+                self.img_spec.setImage(np.zeros((1, 1), dtype=np.float32), autoLevels=True)
+                self.img_spec.setRect(QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
+            except Exception:
+                pass
+
     def init_spectrogram(self, grid_layout: QtWidgets.QGridLayout):
+        # Plot canvas
         self.p_spec = pg.PlotWidget()
         self.p_spec.setBackground('k')
         self.p_spec.setLabel("bottom", "Tijd (s)")
@@ -275,55 +277,109 @@ class App(QtWidgets.QMainWindow):
         self.p_spec.setMouseEnabled(x=True, y=True)
         self.p_spec.setXLink(self.p_wave)
 
+        # ImageItem + veilige 1×1 start-image (voorkomt NoneType issues)
         self.img_spec = pg.ImageItem(axisOrder='row-major')
+        self.img_spec.setImage(np.zeros((1, 1), dtype=np.float32), autoLevels=True)
+        self.img_spec.setRect(QtCore.QRectF(0.0, 0.0, 1.0, 1.0))
         self.p_spec.addItem(self.img_spec)
 
+        # Inferno colormap + ColorBar
         self.colorbar = None
-        if not GRAYSCALE_DEBUG:
+        try:
+            cmap = pg.colormap.get('inferno')                     # pyqtgraph >= 0.12
+            self.img_spec.setLookupTable(cmap.getLookupTable())   # koppel LUT aan image # type: ignore
+            self.colorbar = pg.ColorBarItem(values=(-100, 0), colorMap=cmap)
             try:
-                cmap = pg.colormap.get('inferno')
-                self.colorbar = pg.ColorBarItem(values=(-100, 0), colorMap=cmap)
-                try:
-                    self.colorbar.setImageItem(self.img_spec, insertIn=self.p_spec.getPlotItem()) # type: ignore
-                except TypeError:
-                    self.colorbar.setImageItem(self.img_spec)
-            except Exception:
-                pass
+                # mooi in de plot integreren als jouw pg-versie het ondersteunt
+                self.colorbar.setImageItem(self.img_spec, insertIn=self.p_spec.getPlotItem())  # type: ignore
+            except TypeError:
+                self.colorbar.setImageItem(self.img_spec)  # fallback
+        except Exception:
+            # Colormap is nice-to-have; zonder werkt het ook in grijswaarden
+            self.colorbar = None
 
         grid_layout.addWidget(self.p_spec, 2, 0)
 
+        # Info-balk onderaan
         row = QtWidgets.QHBoxLayout()
         self.lbl_stft_params = QtWidgets.QLabel("")
         self.lbl_stft_params.setStyleSheet("color: gray; font-size: 10pt;")
         row.addWidget(self.lbl_stft_params)
-        self.btn_stft_info = QtWidgets.QToolButton(); self.btn_stft_info.setText("Info"); self.btn_stft_info.clicked.connect(self._show_stft_info); row.addWidget(self.btn_stft_info)
+        self.btn_stft_info = QtWidgets.QToolButton()
+        self.btn_stft_info.setText("Info")
+        self.btn_stft_info.clicked.connect(self._show_stft_info)
+        row.addWidget(self.btn_stft_info)
         grid_layout.addLayout(row, 3, 0)
 
     def update_spectrogram(self):
-        y = self.current_signal()
-        if y is None or len(y) == 0:
-            _dbg("[STFT] geen data"); return
-        cfg = getattr(self, "_stft_cfg", {"nperseg":1024,"hop":256,"window":"hann"})
-        f, t, S_db = compute_stft_db(y, self.sr, nperseg=int(cfg.get("nperseg",1024)), hop=int(cfg.get("hop",256)), window=str(cfg.get("window","hann")))
-        if S_db.size == 0:
-            _dbg("[STFT] leeg"); return
-        if getattr(self, "chk_bp", None) and self.chk_bp.isChecked():
-            fmax_plot = min(float(self.sp_high.value()), float(self.sr)/2.0 - 1e-6)
-        else:
-            fmax_plot = float(f[-1])
-        mask = f <= fmax_plot
-        if not np.any(mask):
-            mask = f <= f[-1]
-        f_plot = f[mask]; img = S_db[mask, :]
+        try:
+            y = self.current_signal()
+            if y is None or len(y) == 0:
+                return
 
-        if len(t) > 1 and len(f_plot) > 1:
-            t_max = float(t[-1]); f_max = float(f_plot[-1])
+            cfg = getattr(self, "_stft_cfg", {"nperseg":1024, "hop":256, "window":"hann"})
+            f, t, S_db = compute_stft_db(
+                y, self.sr,
+                nperseg=int(cfg.get("nperseg", 1024)),
+                hop=int(cfg.get("hop", 256)),
+                window=str(cfg.get("window", "hann"))
+            )
+            if S_db.size == 0 or len(t) <= 1 or len(f) <= 1:
+                return
+
+            # Max te tonen frequentie (rekening houdend met bandpass UI)
+            if getattr(self, "chk_bp", None) and self.chk_bp.isChecked():
+                fmax_plot = min(float(self.sp_high.value()), float(self.sr)/2.0 - 1e-6)
+            else:
+                fmax_plot = float(f[-1])
+
+            mask = f <= fmax_plot
+            if not np.any(mask):
+                mask = f <= f[-1]
+
+            f_plot = f[mask]
+            img = S_db[mask, :]  # (freq, time) verwacht
+
+            # Sommige STFT helpers geven (time, freq)
+            if img.shape == (len(t), len(f_plot)):
+                img = img.T  # forceer (freq, time)
+
+            # Sanitize & typify
+            img = np.nan_to_num(img, neginf=-120.0, posinf=0.0).astype(np.float32, copy=False)
+
+            # Robuuste levels via percentielen; val terug op [-100, 0] dB
+            try:
+                vmin = float(np.percentile(img, 2.0))
+                vmax = float(np.percentile(img, 98.0))
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+                    raise ValueError
+            except Exception:
+                vmin, vmax = -100.0, 0.0
+
+            # 1) Altijd EERST de image zetten (dan kent ImageItem breedte/hoogte)
+            #    DYNAMIC_SPECTRO_LEVELS kan True/False zijn in je config
+            auto_lv = bool(DYNAMIC_SPECTRO_LEVELS)
+            if auto_lv:
+                self.img_spec.setImage(img, autoLevels=True)
+            else:
+                self.img_spec.setImage(img, autoLevels=False, levels=(vmin, vmax))
+
+            # 2) Dan de geometrie (wereldcoördinaten tijd×frequentie)
+            t_max = max(float(t[-1]), 1e-6)
+            f_max = max(float(f_plot[-1]) if len(f_plot) else float(f[-1]), 1e-6)
             self.img_spec.setRect(QtCore.QRectF(0.0, 0.0, t_max, f_max))
-            self.p_spec.setLimits(xMin=0.0, xMax=t_max, yMin=0.0, yMax=f_max)
-            self.p_spec.setXRange(0.0, t_max); self.p_spec.setYRange(0.0, f_max)
 
-        cfg = getattr(self, "_stft_cfg", {"nperseg":1024,"hop":256,"window":"hann"})
-        self.lbl_stft_params.setText(f"STFT: nperseg={cfg.get('nperseg')} | hop={cfg.get('hop')} | window={cfg.get('window')}")
+            # 3) As-limieten / ranges
+            self.p_spec.setLimits(xMin=0.0, xMax=t_max, yMin=0.0, yMax=f_max)
+            self.p_spec.setXRange(0.0, t_max)
+            self.p_spec.setYRange(0.0, f_max)
+
+            # 4) UI label
+            self.lbl_stft_params.setText(
+                f"STFT: nperseg={cfg.get('nperseg')} | hop={cfg.get('hop')} | window={cfg.get('window')}"
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
 
     def on_filter_ui_changed(self, *args):
         """Herbereken/teken wanneer filter-instellingen wijzigen."""
@@ -848,85 +904,181 @@ class App(QtWidgets.QMainWindow):
         self.player.play(self.current_signal(), self.sr, float(seg.t_start), float(seg.t_end))
     # -------------------------------------------------------------------------
 
+    # -------- Labelbar / segment helpers -------------------------------------
+    def _apply_labelset(self, name: str):
+        from .config import LABEL_SETS, labels_list_to_dict
+
+        # Zorg dat custom altijd geladen is
+        if name.lower().startswith("custom"):
+            if not self._custom_labels:
+                # probeer opnieuw labels_dataset.json te laden
+                self.load_labels_json()
+
+            if self._custom_labels:
+                self.labelbar.set_labels(labels_list_to_dict(self._custom_labels))
+            else:
+                # fallback: toon iets i.p.v. leeg veld
+                self.labelbar.set_labels({"No labels loaded": "Edit labels_dataset.json and reload"})
+        else:
+            labels = LABEL_SETS.get(name, {})
+            self.labelbar.set_labels(labels if labels else {"No labels": "Empty label set"})
+
+        # altijd even de metadata dropdown updaten
+        self._refresh_location_choices()
+        # knoppen up-to-date met huidig segment
+        self._reflect_labelbar()
+
     def open_folder_dialog(self, first=False):
         self.player.stop()
         dlg = StartDialog(self)
         if not dlg.exec():
             return
-        self.root = dlg.root or ""
-        self.session_meta = dlg.get_meta()
-        mic = self.session_meta.get("microphone_type", "")
-        loc = self.session_meta.get("location", "")
-        if mic: self.bump_recents(mic=mic) # type: ignore
-        if loc: self.bump_recents(loc=loc) # type: ignore
-        self.load_labels_json()
-        self.build_file_queue(self.root)
-        if not self.files:
-            QtWidgets.QMessageBox.information(self, "Info", "Geen .wav-bestanden gevonden.")
-            return
-        self._populate_jump_list()
-        self.idx = 0
-        self.load_current()
+        try:
+            self.root = dlg.root or ""
+            self.session_meta = dlg.get_meta()
+            mic = self.session_meta.get("microphone_type", "")
+            loc = self.session_meta.get("location", "")
+            if mic: self.bump_recents(mic=mic) # type: ignore
+            if loc: self.bump_recents(loc=loc) # type: ignore
+
+            self.load_labels_json()
+            self.build_file_queue(self.root)
+            print(f"[DEBUG] open_folder_dialog: root={self.root} files={len(self.files)}")
+
+            if not self.files:
+                QtWidgets.QMessageBox.information(self, "Info", "Geen .wav-bestanden gevonden.")
+                return
+
+            self._populate_jump_list()
+            self.idx = 0
+            self.load_current()
+            self._after_navigation_changed()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QtWidgets.QMessageBox.critical(self, "Fout bij openen", f"{e}")
 
     def build_file_queue(self, root: str):
-        files = []
-        for name in sorted(os.listdir(root)):
-            p = os.path.join(root, name)
-            if os.path.isfile(p) and p.lower().endswith(".wav"):
-                files.append(p)
-        for dirpath, dirnames, filenames in os.walk(root):
-            if os.path.abspath(dirpath) == os.path.abspath(root):
-                continue
-            for f in sorted(filenames):
-                if f.lower().endswith(".wav"):
-                    files.append(os.path.join(dirpath, f))
+        files: list[str] = []
+        try:
+            root = os.path.normpath(root)
+            if not os.path.isdir(root):
+                print(f"[DEBUG] build_file_queue: not a directory -> {root}")
+                self.files = []
+                return
+
+            # 1) .wav direct in root
+            for name in sorted(os.listdir(root)):
+                p = os.path.join(root, name)
+                if os.path.isfile(p) and name.lower().endswith(".wav"):
+                    files.append(p)
+
+            # 2) .wav in submappen (recursief)
+            for dirpath, dirnames, filenames in os.walk(root):
+                # sla het root-niveau over; dat hebben we net gedaan
+                if os.path.abspath(dirpath) == os.path.abspath(root):
+                    continue
+                for f in sorted(filenames):
+                    if f.lower().endswith(".wav"):
+                        files.append(os.path.join(dirpath, f))
+
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Map lezen", f"Kon map niet lezen:\n{root}\n\n{e}")
+            print(f"[DEBUG] build_file_queue error: {e!r}")
+            files = []
+
+        # Log resultaat en bewaar
         self.files = files
+        print(f"[DEBUG] build_file_queue: root={root} -> {len(self.files)} wavs")
+        if self.files[:3]:
+            print("[DEBUG] examples:", *self.files[:3], sep="\n  - ")
+
+    def _safe_read_wav(self, path: str):
+        try:
+            y, sr = sf.read(path, dtype="float32", always_2d=False)
+            if isinstance(y, np.ndarray) and y.ndim == 2:
+                y = y.mean(axis=1)
+            if y is None or (isinstance(y, np.ndarray) and y.size == 0):
+                raise ValueError("Empty audio")
+            return y.astype(np.float32, copy=False), int(sr)
+        except Exception as e:
+            print(f"[WARN] Skip unreadable WAV: {path} -> {e}")
+            return None, None
 
     def load_current(self):
-        f = self.files[self.idx]
-        self.lbl_path.setText(f"{human_relpath(self.root, os.path.dirname(f))}/{os.path.basename(f)}")
+        try:
+            print(f"[DEBUG] load_current: idx={self.idx} total={len(self.files)}")
+            if not self.files:
+                QtWidgets.QMessageBox.information(self, "Info", "Geen .wav-bestanden in de gekozen map.")
+                return
+            if not (0 <= self.idx < len(self.files)):
+                self.idx = 0
 
-        y, sr = sf.read(f, dtype="float32", always_2d=False)
-        if isinstance(y, np.ndarray) and y.ndim == 2:
-            y = y.mean(axis=1)
-        self.y_raw = np.asarray(y, dtype=np.float32)
-        self._filt_cache = None; self._filt_params = None
-        self.sr = int(sr); self.t = np.arange(len(self.y_raw), dtype=float) / self.sr  # type: ignore
+            # probeer door totdat een leesbare wav gevonden is
+            tried = 0
+            y = None; sr = None
+            while tried < len(self.files):
+                f = self.files[self.idx]
+                y, sr = self._safe_read_wav(f)
+                if y is not None:
+                    break
+                self.idx = (self.idx + 1) % len(self.files)
+                tried += 1
 
-        dur = float(len(self.y_raw)) / float(self.sr) if len(self.y_raw) else 0.0
-        self.time_slider.blockSignals(True); self.time_slider.setRange(0, int(dur*100)); self.time_slider.setValue(0); self.time_slider.blockSignals(False)
-        self.lbl_time.setText("0.00 s"); self.playhead.setPos(0.0)
+            if y is None:
+                QtWidgets.QMessageBox.warning(self, "Openen mislukt", "Geen enkele .wav kon worden gelezen.")
+                return
 
-        js_path = json_sidecar_path(f)
-        if os.path.isfile(js_path):
-            try:
-                with open(js_path, "r", encoding="utf-8") as fh:
-                    self.state = FileState.from_json(json.load(fh))
-            except Exception:
+            # UI + state
+            f = self.files[self.idx]
+            self.lbl_path.setText(f"{human_relpath(self.root, os.path.dirname(f))}/{os.path.basename(f)}")
+            self.y_raw = y
+            self._filt_cache = None; self._filt_params = None
+            self.sr = int(sr) # type: ignore
+            assert self.y_raw is not None
+            self.t = np.arange(len(self.y_raw), dtype=float) / self.sr
+
+            dur = float(len(self.y_raw)) / float(self.sr) if len(self.y_raw) else 0.0
+            self.time_slider.blockSignals(True); self.time_slider.setRange(0, int(dur*100)); self.time_slider.setValue(0); self.time_slider.blockSignals(False)
+            self.lbl_time.setText("0.00 s"); self.playhead.setPos(0.0)
+
+            # JSON
+            js_path = json_sidecar_path(f)
+            if os.path.isfile(js_path):
+                try:
+                    with open(js_path, "r", encoding="utf-8") as fh:
+                        self.state = FileState.from_json(json.load(fh))
+                except Exception:
+                    self.state = FileState(file=os.path.basename(f), sr=self.sr, meta=dict(self.session_meta), segments=[])
+            else:
                 self.state = FileState(file=os.path.basename(f), sr=self.sr, meta=dict(self.session_meta), segments=[])
-        else:
-            self.state = FileState(file=os.path.basename(f), sr=self.sr, meta=dict(self.session_meta), segments=[])
 
-        # Merge defaults uit sessie, behoud per-file waarden
-        if not isinstance(self.state.meta, dict):
-            self.state.meta = {}
-        for k, v in (self.session_meta or {}).items():
-            self.state.meta.setdefault(k, v)
+            if not isinstance(self.state.meta, dict):
+                self.state.meta = {}
+            for k, v in (self.session_meta or {}).items():
+                self.state.meta.setdefault(k, v)
 
-        # editor met 4 velden
-        meta_for_editor = {k: self.state.meta.get(k, "") for k in METADATA_FIELDS}
-        self.meta_inline.set_values(meta_for_editor)
-        self._refresh_location_choices()
-        _apply_labelset(self.labelset_combo.currentText())
+            meta_for_editor = {k: self.state.meta.get(k, "") for k in METADATA_FIELDS}
+            self.meta_inline.set_values(meta_for_editor)
+            self._refresh_location_choices()
+            self._apply_labelset(self.labelset_combo.currentText())
 
-        self.draw_waveform(); self.update_spectrogram()
+            self.draw_waveform()
+            self.update_spectrogram()
 
-        self._blocking = True
-        init_len = min(3.0, dur) if dur > 0.0 else 0.0
-        self.region.setRegion((0.0, init_len)); self.sel_start.setValue(0.0); self.sel_end.setValue(init_len); self.lbl_sel_delta.setText(f"(Δ {init_len:.2f} s)")
-        self._blocking = False
+            self._blocking = True
+            init_len = min(3.0, dur) if dur > 0.0 else 0.0
+            self.region.setRegion((0.0, init_len)); self.sel_start.setValue(0.0); self.sel_end.setValue(init_len); self.lbl_sel_delta.setText(f"(Δ {init_len:.2f} s)")
+            self._blocking = False
 
-        self.refresh_segment_list(); self.save_json()
+            self.refresh_segment_list()
+            self.save_json()
+            print(f"[DEBUG] loaded: {f}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QtWidgets.QMessageBox.critical(self, "Fout tijdens laden", f"{e}")
+
 
     def draw_waveform(self):
         y = self.current_signal(); x = self.t
