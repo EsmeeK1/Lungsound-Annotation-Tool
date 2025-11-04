@@ -6,7 +6,7 @@
 This project is a **Lung Sound Viewer & Annotation Tool** built with **PySide6** and **PyQtGraph**.
 Developed as part of the **HeartGuard / LungInsight project**, it enables loading, visualizing, annotating, and analyzing lung sound recordings. You can view waveforms and spectrograms, select intervals, label segments (e.g., “Inhalation”, “Exhalation”, “Wheeze”), and export annotations for research or machine learning.
 
-![Screenshot of the Current Tool](images/screenshot_tool.png)
+![Screenshot of the Current Tool](images/screenshot_tool_4_11_25.png)
 
 ### What is a lung sound?
 **Lung sounds** are audio signals recorded from the chest, reflecting airflow and respiratory events.
