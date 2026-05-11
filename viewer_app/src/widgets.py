@@ -1,6 +1,4 @@
 from PySide6 import QtCore, QtWidgets
-from PySide6.QtGui import QRegularExpressionValidator
-from PySide6.QtCore import QRegularExpression
 import typing as _t
 import pyqtgraph as pg
 from typing import Optional
