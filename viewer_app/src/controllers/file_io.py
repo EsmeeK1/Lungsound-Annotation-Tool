@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 import datetime
 import json
+import math
 import os
 
 import numpy as np
@@ -12,7 +13,7 @@ from PySide6 import QtWidgets
 
 from ..app_settings import METADATA_FIELDS
 from ..dialogs import StartDialog
-from ..data_models import FileState
+from ..data_models import AudioItem, FileState
 from ..file_paths import (
     csv_path_for_root,
     ensure_dir,
@@ -21,10 +22,16 @@ from ..file_paths import (
 )
 
 
+CHUNK_SECONDS = 60.0
+
+
 class FileIOMixin:
     """
-    Handles folder opening, WAV loading, JSON sidecars, file navigation,
-    and CSV export.
+    Handles folder opening, WAV loading, virtual 1-minute chunks,
+    JSON sidecars, file navigation, and CSV export.
+
+    Long WAV files are not split on disk. Instead, the navigation queue contains
+    virtual AudioItem chunks that all point to the original WAV file.
     """
 
     # ------------------------------------------------------------------
@@ -45,16 +52,12 @@ class FileIOMixin:
 
         try:
             self.root = dlg.root or ""
-
-            # Metadata is handled inline per file.
-            # Session metadata is only used for carry-over values such as
-            # the last used environment.
             self.session_meta = {}
 
             self.load_labels_json()
             self.build_file_queue(self.root)
 
-            #print(f"[DEBUG] open_folder_dialog: root={self.root} files={len(self.files)}")
+            #print(f"[DEBUG] open_folder_dialog: root={self.root} items={len(self.files)}")
 
             if not self.files:
                 QtWidgets.QMessageBox.information(
@@ -75,11 +78,66 @@ class FileIOMixin:
             traceback.print_exc()
             QtWidgets.QMessageBox.critical(self, "Open error", f"{exc}")
 
+    def _audio_items_for_wav(self: Any, path: str) -> list[AudioItem]:
+        """
+        Return one or more virtual navigation items for a WAV file.
+
+        Files longer than CHUNK_SECONDS are represented as multiple virtual
+        chunks. No new audio files are written.
+        """
+        try:
+            info = sf.info(path)
+            duration = float(info.frames) / float(info.samplerate)
+        except Exception as exc:
+            print(f"[WARN] Could not inspect WAV duration: {path} -> {exc}")
+            return [
+                AudioItem(
+                    source_path=path,
+                    chunk_start=0.0,
+                    chunk_end=CHUNK_SECONDS,
+                    chunk_index=1,
+                    chunk_count=1,
+                )
+            ]
+
+        if duration <= CHUNK_SECONDS:
+            return [
+                AudioItem(
+                    source_path=path,
+                    chunk_start=0.0,
+                    chunk_end=duration,
+                    chunk_index=1,
+                    chunk_count=1,
+                )
+            ]
+
+        chunk_count = int(math.ceil(duration / CHUNK_SECONDS))
+        items: list[AudioItem] = []
+
+        for i in range(chunk_count):
+            start = i * CHUNK_SECONDS
+            end = min((i + 1) * CHUNK_SECONDS, duration)
+
+            items.append(
+                AudioItem(
+                    source_path=path,
+                    chunk_start=start,
+                    chunk_end=end,
+                    chunk_index=i + 1,
+                    chunk_count=chunk_count,
+                )
+            )
+
+        return items
+
     def build_file_queue(self: Any, root: str) -> None:
         """
-        Build a list of .wav files from the root and its subfolders.
+        Build a navigation queue from .wav files.
+
+        Short WAV files become one AudioItem.
+        Long WAV files become multiple virtual 1-minute AudioItems.
         """
-        files: list[str] = []
+        items: list[AudioItem] = []
 
         try:
             root = os.path.normpath(root)
@@ -89,11 +147,13 @@ class FileIOMixin:
                 self.files = []
                 return
 
+            wav_paths: list[str] = []
+
             # WAV files directly in root.
             for name in sorted(os.listdir(root)):
                 path = os.path.join(root, name)
                 if os.path.isfile(path) and name.lower().endswith(".wav"):
-                    files.append(path)
+                    wav_paths.append(path)
 
             # WAV files in subfolders.
             for dirpath, _dirnames, filenames in os.walk(root):
@@ -102,7 +162,10 @@ class FileIOMixin:
 
                 for filename in sorted(filenames):
                     if filename.lower().endswith(".wav"):
-                        files.append(os.path.join(dirpath, filename))
+                        wav_paths.append(os.path.join(dirpath, filename))
+
+            for path in wav_paths:
+                items.extend(self._audio_items_for_wav(path))
 
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
@@ -111,27 +174,61 @@ class FileIOMixin:
                 f"Could not read folder:\n{root}\n\n{exc}",
             )
             #print(f"[DEBUG] build_file_queue error: {exc!r}")
-            files = []
+            items = []
 
-        self.files = files
+        self.files = items
 
-        #print(f"[DEBUG] build_file_queue: root={root} -> {len(self.files)} wavs")
-        #if self.files[:3]:
-        #    print("[DEBUG] examples:", *self.files[:3], sep="\n  - ")
+        #print(f"[DEBUG] build_file_queue: root={root} -> {len(self.files)} audio items")
+        # if self.files[:3]:
+        #     print(
+        #         "[DEBUG] examples:",
+        #         *[self._display_name_for_item(item) for item in self.files[:3]],
+        #         sep="\n  - ",
+        #     )
 
     # ------------------------------------------------------------------
     # WAV loading / sidecar state
     # ------------------------------------------------------------------
 
-    def _safe_read_wav(self: Any, path: str):
+    def _current_audio_item(self: Any) -> AudioItem | None:
+        """
+        Return the current virtual audio item.
+        """
+        if not (0 <= self.idx < len(self.files)):
+            return None
+        return self.files[self.idx]
+
+    def _safe_read_wav(
+        self: Any,
+        path: str,
+        chunk_start: float = 0.0,
+        chunk_end: float | None = None,
+    ):
         """
         Read a WAV file as mono float32.
 
-        Returns:
-            (audio, sample_rate) or (None, None) on failure.
+        When chunk_start/chunk_end are provided, only that audio range is read.
+        Returns (audio, sample_rate) or (None, None) on failure.
         """
         try:
-            y, sr = sf.read(path, dtype="float32", always_2d=False)
+            info = sf.info(path)
+            sr = int(info.samplerate)
+
+            start_frame = max(0, int(round(chunk_start * sr)))
+
+            if chunk_end is None:
+                frames = -1
+            else:
+                end_frame = min(int(info.frames), int(round(chunk_end * sr)))
+                frames = max(0, end_frame - start_frame)
+
+            y, sr_read = sf.read(
+                path,
+                start=start_frame,
+                frames=frames,
+                dtype="float32",
+                always_2d=False,
+            )
 
             if isinstance(y, np.ndarray) and y.ndim == 2:
                 y = y.mean(axis=1)
@@ -139,7 +236,7 @@ class FileIOMixin:
             if y is None or (isinstance(y, np.ndarray) and y.size == 0):
                 raise ValueError("Empty audio")
 
-            return y.astype(np.float32, copy=False), int(sr)
+            return y.astype(np.float32, copy=False), int(sr_read)
 
         except Exception as exc:
             print(f"[WARN] Skip unreadable WAV: {path} -> {exc}")
@@ -147,7 +244,10 @@ class FileIOMixin:
 
     def load_current(self: Any) -> None:
         """
-        Load the current WAV file, update UI, and draw plots.
+        Load the current virtual audio item, update UI, and draw plots.
+
+        Segment state is loaded from the JSON sidecar of the original source WAV.
+        Segment times remain absolute relative to that original WAV.
         """
         try:
             #print(f"[DEBUG] load_current: idx={self.idx} total={len(self.files)}")
@@ -163,14 +263,19 @@ class FileIOMixin:
             if not (0 <= self.idx < len(self.files)):
                 self.idx = 0
 
-            # Keep advancing until we find a readable WAV.
+            # Keep advancing until we find a readable WAV chunk.
             tried = 0
             y = None
             sr = None
+            item = None
 
             while tried < len(self.files):
-                file_path = self.files[self.idx]
-                y, sr = self._safe_read_wav(file_path)
+                item = self.files[self.idx]
+                y, sr = self._safe_read_wav(
+                    item.source_path,
+                    chunk_start=item.chunk_start,
+                    chunk_end=item.chunk_end,
+                )
 
                 if y is not None:
                     break
@@ -178,7 +283,7 @@ class FileIOMixin:
                 self.idx = (self.idx + 1) % len(self.files)
                 tried += 1
 
-            if y is None or sr is None:
+            if y is None or sr is None or item is None:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "Open failed",
@@ -186,12 +291,9 @@ class FileIOMixin:
                 )
                 return
 
-            file_path = self.files[self.idx]
+            self.current_item = item
 
-            self.lbl_path.setText(
-                f"{human_relpath(self.root, os.path.dirname(file_path))}/"
-                f"{os.path.basename(file_path)}"
-            )
+            self.lbl_path.setText(self._display_name_for_item(item))
 
             self.y_raw = y
             self._filt_cache = None
@@ -214,8 +316,8 @@ class FileIOMixin:
             self.lbl_time.setText("0.00 s")
             self.playhead.setPos(0.0)
 
-            # Load or create JSON sidecar.
-            json_path = json_sidecar_path(file_path)
+            # Sidecar JSON belongs to the original WAV, not the virtual chunk.
+            json_path = json_sidecar_path(item.source_path)
 
             if os.path.isfile(json_path):
                 try:
@@ -223,14 +325,14 @@ class FileIOMixin:
                         self.state = FileState.from_json(json.load(fh))
                 except Exception:
                     self.state = FileState(
-                        file=os.path.basename(file_path),
+                        file=os.path.basename(item.source_path),
                         sr=self.sr,
                         meta=dict(self.session_meta),
                         segments=[],
                     )
             else:
                 self.state = FileState(
-                    file=os.path.basename(file_path),
+                    file=os.path.basename(item.source_path),
                     sr=self.sr,
                     meta=dict(self.session_meta),
                     segments=[],
@@ -254,7 +356,6 @@ class FileIOMixin:
                 self.state.meta.pop(old_key, None)
 
             # Apply supported session defaults.
-            # This makes the last used environment carry over to the next file.
             for key, value in (self.session_meta or {}).items():
                 if key in METADATA_FIELDS and str(value).strip() != "":
                     self.state.meta.setdefault(key, value)
@@ -273,10 +374,10 @@ class FileIOMixin:
             self.draw_waveform()
             self.update_spectrogram()
 
-            # Initialize selection region.
+            # Initialize local selection region.
             self._blocking = True
 
-            init_len = min(3.0, duration) if duration > 0.0 else 0.0
+            init_len = min(1.0, duration) if duration > 0.0 else 0.0
             self.region.setRegion((0.0, init_len))
             self.sel_start.setValue(0.0)
             self.sel_end.setValue(init_len)
@@ -287,7 +388,7 @@ class FileIOMixin:
             self.refresh_segment_list()
             self.save_json()
 
-            #print(f"[DEBUG] loaded: {file_path}")
+            #print(f"[DEBUG] loaded: {self._display_name_for_item(item)}")
 
         except Exception as exc:
             import traceback
@@ -297,15 +398,18 @@ class FileIOMixin:
 
     def save_json(self: Any) -> None:
         """
-        Write the current FileState to its sidecar JSON.
+        Write the current FileState to the source WAV sidecar JSON.
+
+        For virtual chunks, all chunks of the same source WAV share one JSON.
         """
         if not self.state:
             return
 
-        if not (0 <= self.idx < len(self.files)):
+        item = self._current_audio_item()
+        if item is None:
             return
 
-        json_path = json_sidecar_path(self.files[self.idx])
+        json_path = json_sidecar_path(item.source_path)
         ensure_dir(json_path)
 
         with open(json_path, "w", encoding="utf-8") as fh:
@@ -322,7 +426,7 @@ class FileIOMixin:
 
     def advance(self: Any, step: int) -> None:
         """
-        Move to the next or previous file and refresh the UI.
+        Move to the next or previous virtual audio item.
         """
         self.player.stop()
 
@@ -335,6 +439,15 @@ class FileIOMixin:
         self.load_current()
         self._after_navigation_changed()
 
+    def _format_time_mmss(self: Any, seconds: float) -> str:
+        """
+        Format seconds as MM:SS.
+        """
+        seconds = max(0.0, float(seconds))
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+
     def _rel_display_name(self: Any, abspath: str) -> str:
         """
         Return a path relative to the current root, with forward slashes.
@@ -346,18 +459,33 @@ class FileIOMixin:
 
         return rel.replace("\\", "/")
 
+    def _display_name_for_item(self: Any, item: AudioItem) -> str:
+        """
+        Return the display name for a virtual audio item.
+        """
+        base = self._rel_display_name(item.source_path)
+
+        if not item.is_chunked:
+            return base
+
+        return (
+            f"{base} — "
+            f"{self._format_time_mmss(item.chunk_start)}–"
+            f"{self._format_time_mmss(item.chunk_end)} "
+            f"({item.chunk_index}/{item.chunk_count})"
+        )
+
     def _populate_jump_list(self: Any) -> None:
         """
-        Fill the Jump-to combo with the current file list and select the active one.
+        Fill the Jump-to combo with the current virtual audio item list.
         """
         self.combo_jump.blockSignals(True)
         self.combo_jump.clear()
 
-        display_names: list[str] = []
-
-        for path in self.files:
-            abspath = path if isinstance(path, str) else getattr(path, "path", "")
-            display_names.append(self._rel_display_name(abspath))
+        display_names = [
+            self._display_name_for_item(item)
+            for item in self.files
+        ]
 
         self.combo_jump.addItems(display_names)
         self.combo_jump.setEnabled(len(display_names) > 0)
@@ -369,7 +497,7 @@ class FileIOMixin:
 
     def _on_jump_selected(self: Any, index: int) -> None:
         """
-        Load the file corresponding to the selected Jump-to item.
+        Load the virtual audio item that corresponds to the selected Jump-to item.
         """
         if not (0 <= index < len(self.files)):
             return
@@ -383,7 +511,7 @@ class FileIOMixin:
 
     def _after_navigation_changed(self: Any) -> None:
         """
-        Keep the Jump-to combo in sync with the current file index.
+        Keep the Jump-to combo in sync with the current index.
         """
         if self.combo_jump.isEnabled() and 0 <= self.idx < self.combo_jump.count():
             self.combo_jump.blockSignals(True)
@@ -396,10 +524,11 @@ class FileIOMixin:
 
     def export_csv(self: Any) -> None:
         """
-        Export all segments for all files to a CSV file.
+        Export all segments for all original WAV files to a CSV file.
 
-        Metadata columns are included only when values are filled in at least
-        one exported row.
+        Segment times are absolute relative to the original WAV.
+        For context, chunk_start/chunk_end columns indicate the virtual chunk
+        where the segment starts.
         """
         if not self.state:
             return
@@ -407,8 +536,17 @@ class FileIOMixin:
         rows: list[dict[str, object]] = []
         today = datetime.date.today().isoformat()
 
-        for file_path in self.files:
-            json_path = json_sidecar_path(file_path)
+        # Export each source WAV only once, even if it has many virtual chunks.
+        source_paths: list[str] = []
+        seen: set[str] = set()
+
+        for item in self.files:
+            if item.source_path not in seen:
+                source_paths.append(item.source_path)
+                seen.add(item.source_path)
+
+        for source_path in source_paths:
+            json_path = json_sidecar_path(source_path)
 
             if not os.path.isfile(json_path):
                 continue
@@ -429,9 +567,14 @@ class FileIOMixin:
             )
 
             for segment in sorted_segments:
+                chunk_start = math.floor(float(segment.t_start) / CHUNK_SECONDS) * CHUNK_SECONDS
+                chunk_end = chunk_start + CHUNK_SECONDS
+
                 row: dict[str, object] = {
                     "date": today,
-                    "filename": self._rel_display_name(file_path),
+                    "filename": self._rel_display_name(source_path),
+                    "chunk_start": chunk_start,
+                    "chunk_end": chunk_end,
                     "t_start": segment.t_start,
                     "t_end": segment.t_end,
                     "label": ";".join(segment.labels),

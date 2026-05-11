@@ -1,6 +1,33 @@
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List
 
+@dataclass(frozen=True)
+class AudioItem:
+    """
+    One item in the app's navigation queue.
+
+    For normal short WAV files:
+      - chunk_start = 0
+      - chunk_end = full duration
+      - chunk_count = 1
+
+    For long WAV files:
+      - multiple AudioItem objects point to the same source_path
+      - each item represents a virtual 1-minute chunk
+    """
+    source_path: str
+    chunk_start: float
+    chunk_end: float
+    chunk_index: int = 1
+    chunk_count: int = 1
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, float(self.chunk_end) - float(self.chunk_start))
+
+    @property
+    def is_chunked(self) -> bool:
+        return self.chunk_count > 1
 
 @dataclass
 class Segment:

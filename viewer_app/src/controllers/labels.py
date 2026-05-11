@@ -69,7 +69,7 @@ class LabelsMixin:
                 "window": "hann",
             },
             "auto_segment_defaults": {
-                "length_s": 3.00,
+                "length_s": 1.00,
                 "overlap_s": 0.00,
                 "label": "",
             },
@@ -127,7 +127,7 @@ class LabelsMixin:
         self._auto_seg_cfg = cfg.get(
             "auto_segment_defaults",
             {
-                "length_s": 3.0,
+                "length_s": 1.0,
                 "overlap_s": 0.0,
                 "label": fallback_label,
             },

@@ -352,6 +352,10 @@ class AudioViewMixin:
     def on_region_changed(self: Any) -> None:
         """
         Sync the selection region with the spin boxes and delta label.
+
+        When the user manually moves the free region, clear the active segment
+        selection. Otherwise label clicks would keep editing the previously
+        selected segment instead of creating a new segment.
         """
         if self._blocking:
             return
@@ -370,9 +374,15 @@ class AudioViewMixin:
 
         self._blocking = False
 
+        # User changed the free selection region, so this should no longer
+        # be treated as editing the previously selected segment.
+        self.clear_segment_selection_for_free_region()
+
     def on_sel_spin_changed(self: Any) -> None:
         """
         Sync the selection spin boxes with the selection region.
+
+        Manual changes to these fields also switch back to free-region mode.
         """
         if self._blocking:
             return
@@ -391,6 +401,9 @@ class AudioViewMixin:
         self.lbl_sel_delta.setText(f"(Δ {(b - a):.2f} s)")
 
         self._blocking = False
+
+        # User changed the free selection manually, so clear selected segment.
+        self.clear_segment_selection_for_free_region()
 
     def nudge_region(
         self: Any,
@@ -440,6 +453,9 @@ class AudioViewMixin:
         self.lbl_sel_delta.setText(f"(Δ {(new_b - new_a):.2f} s)")
 
         self._blocking = False
+
+        # Keyboard nudging means the user is defining a new free region.
+        self.clear_segment_selection_for_free_region()
 
     # ------------------------------------------------------------------
     # Time slider / playback
@@ -567,14 +583,19 @@ class AudioViewMixin:
         if segment_id is None:
             return
 
+        visible_ids = getattr(self, "visible_segment_ids", [])
         clicked_row = -1
 
-        for i, segment in enumerate(self.state.segments):
-            if segment.id == segment_id:
+        for i, visible_id in enumerate(visible_ids):
+            if visible_id == segment_id:
                 clicked_row = i
                 break
 
         if clicked_row < 0:
+            return
+
+        segment = self._segment_by_id(segment_id)
+        if segment is None:
             return
 
         def set_current_without_changing_selection(row: int) -> None:
@@ -633,15 +654,19 @@ class AudioViewMixin:
 
         self.list.blockSignals(False)
 
-        segment = self.state.segments[clicked_row]
-
         self._blocking = True
 
-        self.region.setRegion((segment.t_start, segment.t_end))
-        self.sel_start.setValue(segment.t_start)
-        self.sel_end.setValue(segment.t_end)
+        chunk_start = self._chunk_start()
+        chunk_end = self._chunk_end()
+
+        local_start = max(float(segment.t_start), chunk_start) - chunk_start
+        local_end = min(float(segment.t_end), chunk_end) - chunk_start
+
+        self.region.setRegion((local_start, local_end))
+        self.sel_start.setValue(local_start)
+        self.sel_end.setValue(local_end)
         self.lbl_sel_delta.setText(
-            f"(Δ {(segment.t_end - segment.t_start):.2f} s)"
+            f"(Δ {(local_end - local_start):.2f} s)"
         )
 
         self._blocking = False

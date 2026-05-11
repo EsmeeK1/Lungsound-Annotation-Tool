@@ -20,7 +20,7 @@
     "window": "hann"
   },
   "auto_segment_defaults": {
-    "length_s": 3.0,
+    "length_s": 1.0,
     "overlap_s": 0.0,
     "label": "Normal"
   }

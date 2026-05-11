@@ -99,7 +99,7 @@ class AutoSegmentDialog(QtWidgets.QDialog):
     def __init__(
         self,
         parent=None,
-        default_len=3.00,
+        default_len=1.00,
         default_overlap=0.00,
         default_replace=False,
         label_options=None,

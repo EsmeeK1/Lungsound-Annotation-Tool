@@ -12,6 +12,7 @@ The tool is no longer specific to lung sounds or heart sounds. Labels are define
 
 - Load `.wav` files from a selected folder, including subfolders.
 - View the audio waveform and STFT spectrogram.
+- Automatically show long recordings as **virtual 1-minute chunks** for readability.
 - Create, edit, delete, and multi-select labeled time segments.
 - Select multiple segments in the segment list or directly in the waveform view.
 - Apply labels to one or more selected segments.
@@ -20,7 +21,7 @@ The tool is no longer specific to lung sounds or heart sounds. Labels are define
 - Auto-segment recordings into fixed-length windows.
 - Apply an optional band-pass filter for visualization and playback.
 - Play full audio or individual segments.
-- Store annotations per `.wav` file as JSON sidecars.
+- Store annotations per original `.wav` file as JSON sidecars.
 - Export all annotations to CSV.
 - Store optional metadata: `environment` and `notes`.
 - Empty metadata fields are not included in CSV export.
@@ -97,13 +98,46 @@ python app.py
 
 1. Start the app.
 2. Choose a folder containing `.wav` files.
-3. Select a time interval in the waveform.
-4. Click a label button to create or update a segment.
-5. Use the segment list to inspect, edit, multi-select, or delete segments.
-6. Optionally fill in `environment` and/or `notes`.
-7. Export all annotations to CSV.
+3. If a recording is longer than 1 minute, use the Jump-to menu or Next/Prev buttons to navigate through its virtual chunks.
+4. Select a time interval in the waveform.
+5. Click a label button to create or update a segment.
+6. Use the segment list to inspect, edit, multi-select, or delete segments.
+7. Optionally fill in `environment` and/or `notes`.
+8. Export all annotations to CSV.
 
-Each `.wav` file receives a matching `.json` sidecar file next to the audio file.
+Each original `.wav` file receives a matching `.json` sidecar file next to the audio file.
+
+## Virtual 1-minute chunks
+
+Long recordings are shown as **virtual 1-minute chunks** in the app. This keeps the waveform readable without creating extra `.wav` files.
+
+For example, a 9-minute file remains one audio file on disk:
+
+```text
+recording.wav
+recording.json
+```
+
+But the app displays it as separate navigation items:
+
+```text
+recording.wav — 00:00–01:00 (1/9)
+recording.wav — 01:00–02:00 (2/9)
+recording.wav — 02:00–03:00 (3/9)
+...
+```
+
+Inside each chunk, the UI shows local time from `0–60 seconds`. Storage and export use absolute time relative to the original audio file.
+
+Example:
+
+```text
+Chunk 2 starts at 60 seconds.
+You label 6–7 seconds inside that chunk.
+The JSON and CSV store this as 66–67 seconds in the original file.
+```
+
+This means the interface stays readable, while all annotations remain correctly linked to the original `.wav` recording.
 
 ## Metadata
 
@@ -163,8 +197,8 @@ There are no built-in lung-sound or heart-sound label sets anymore. Define label
 | Shortcut | Action |
 |---|---|
 | Space | Play/pause audio |
-| N | Next file |
-| P | Previous file |
+| N | Next file or virtual chunk |
+| P | Previous file or virtual chunk |
 | Enter / Return | Update selected segment |
 | Delete | Delete selected segment(s) |
 | Ctrl + R | Reset view |
@@ -196,15 +230,26 @@ Base columns:
 | Column | Description |
 |---|---|
 | `date` | Export date |
-| `filename` | Relative audio filename |
-| `t_start` | Segment start time in seconds |
-| `t_end` | Segment end time in seconds |
+| `filename` | Relative original audio filename |
+| `chunk_start` | Start time of the virtual chunk containing the segment |
+| `chunk_end` | End time of the virtual chunk containing the segment |
+| `t_start` | Absolute segment start time in seconds, relative to the original `.wav` file |
+| `t_end` | Absolute segment end time in seconds, relative to the original `.wav` file |
 | `label` | One or more labels separated by `;` |
 
 Optional metadata columns are included only when filled:
 
 - `environment`
 - `notes`
+
+Example:
+
+```csv
+date,filename,chunk_start,chunk_end,t_start,t_end,label
+2026-05-11,recording.wav,60.0,120.0,66.0,67.0,horn
+```
+
+This row means the segment was created at local time `6–7 seconds` inside the second chunk, but it belongs to absolute time `66–67 seconds` in the original file.
 
 ## Project structure
 
@@ -240,7 +285,7 @@ viewer_app/
 | `app.py` | Application entrypoint |
 | `app_window.py` | Main `App` class and shared application state |
 | `app_settings.py` | Constants, preferences, metadata fields, and labels path |
-| `data_models.py` | `Segment` and `FileState` dataclasses |
+| `data_models.py` | `AudioItem`, `Segment`, and `FileState` dataclasses |
 | `dialogs.py` | Folder selection and auto-segmentation dialogs |
 | `widgets.py` | Custom UI widgets |
 | `audio_processing.py` | Band-pass filtering and STFT computation |
@@ -255,7 +300,7 @@ viewer_app/
 | `ui_builder.py` | Builds the Qt UI and connects signals |
 | `shortcuts.py` | Registers keyboard shortcuts |
 | `audio_view.py` | Waveform, spectrogram, playback, filter, and selection region |
-| `file_io.py` | Folder loading, WAV reading, JSON sidecars, navigation, and CSV export |
+| `file_io.py` | Folder loading, WAV reading, virtual chunks, JSON sidecars, navigation, and CSV export |
 | `segments.py` | Segment list, selection, editing, labels, undo/redo, and auto-segmentation |
 | `metadata.py` | Environment/notes handling and recent environments |
 | `labels.py` | Loading labels from `labels_dataset.json` |
@@ -264,14 +309,14 @@ viewer_app/
 
 ### JSON sidecars
 
-Each `.wav` file gets a `.json` file with the same base name:
+Each original `.wav` file gets one `.json` file with the same base name:
 
 ```text
 recording_001.wav
 recording_001.json
 ```
 
-The sidecar stores the file state, metadata, segments, and labels per segment.
+The sidecar stores the file state, metadata, segments, and labels per segment. For long recordings, all virtual chunks share the same JSON sidecar. Segment times in the JSON are absolute times relative to the original `.wav` file.
 
 ### `labels_dataset.json`
 

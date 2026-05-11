@@ -83,16 +83,18 @@ class SegmentsMixin:
 
     def _update_overlay_selection_styles(self: Any) -> None:
         """
-        Refresh overlay styles so selected segments are visible in the waveform.
+        Refresh overlay styles so selected visible segments are visible in the waveform.
         """
         if not self.state:
             return
 
         selected_ids = set(self._selected_segment_ids())
 
-        for segment in self.state.segments:
-            region = self.overlay_regions.get(segment.id)
-            if region is None:
+        for segment_id in getattr(self, "visible_segment_ids", []):
+            segment = self._segment_by_id(segment_id)
+            region = self.overlay_regions.get(segment_id)
+
+            if segment is None or region is None:
                 continue
 
             self._style_overlay_region(
@@ -121,11 +123,85 @@ class SegmentsMixin:
             )
         )
 
+    def _chunk_start(self: Any) -> float:
+        item = getattr(self, "current_item", None)
+        return float(getattr(item, "chunk_start", 0.0) or 0.0)
+
+    def _chunk_end(self: Any) -> float:
+        item = getattr(self, "current_item", None)
+
+        if item is not None:
+            return float(getattr(item, "chunk_end", 0.0) or 0.0)
+
+        if self.t is not None and len(self.t) > 0:
+            return float(self.t[-1])
+
+        return 0.0
+
+    def _chunk_duration(self: Any) -> float:
+        return max(0.0, self._chunk_end() - self._chunk_start())
+
+    def _local_to_absolute(self: Any, t_local: float) -> float:
+        return snap_t(self._chunk_start() + float(t_local))
+
+    def _absolute_to_local(self: Any, t_abs: float) -> float:
+        return snap_t(float(t_abs) - self._chunk_start())
+
+    def _segment_overlaps_current_chunk(self: Any, segment: Segment) -> bool:
+        chunk_start = self._chunk_start()
+        chunk_end = self._chunk_end()
+
+        return (
+            float(segment.t_end) > chunk_start
+            and float(segment.t_start) < chunk_end
+        )
+
+    def _visible_segments(self: Any) -> list[Segment]:
+        if not self.state:
+            return []
+
+        return [
+            segment
+            for segment in self.state.segments
+            if self._segment_overlaps_current_chunk(segment)
+        ]
+
+    def _segment_by_id(self: Any, segment_id: str) -> Optional[Segment]:
+        if not self.state:
+            return None
+
+        for segment in self.state.segments:
+            if segment.id == segment_id:
+                return segment
+
+        return None
+
+    def _segment_for_visible_row(self: Any, row: int) -> Optional[Segment]:
+        visible_ids = getattr(self, "visible_segment_ids", [])
+
+        if not (0 <= row < len(visible_ids)):
+            return None
+
+        return self._segment_by_id(visible_ids[row])
+
+    def _visible_row_for_segment_id(self: Any, segment_id: str) -> int:
+        visible_ids = getattr(self, "visible_segment_ids", [])
+
+        try:
+            return visible_ids.index(segment_id)
+        except ValueError:
+            return -1
+
     def refresh_segment_list(self: Any) -> None:
         """
         Rebuild the segment list and overlay regions on the waveform.
+
+        Only segments that overlap the current virtual chunk are displayed.
+        Segment times in state remain absolute; displayed times are local to
+        the current chunk.
         """
         self.list.clear()
+        self.visible_segment_ids = []
 
         if not self.state:
             return
@@ -141,15 +217,22 @@ class SegmentsMixin:
 
         self.overlay_regions.clear()
 
-        # Add list items and waveform overlay regions.
-        for segment in self.state.segments:
+        chunk_start = self._chunk_start()
+        chunk_end = self._chunk_end()
+
+        for segment in self._visible_segments():
+            self.visible_segment_ids.append(segment.id)
+
+            local_start = max(float(segment.t_start), chunk_start) - chunk_start
+            local_end = min(float(segment.t_end), chunk_end) - chunk_start
+
             label_text = "; ".join(segment.labels) or "(no labels)"
             self.list.addItem(
-                f"{segment.t_start:.2f}-{segment.t_end:.2f}s | {label_text}"
+                f"{local_start:.2f}-{local_end:.2f}s | {label_text}"
             )
 
             reg = ClickableRegion(
-                [segment.t_start, segment.t_end],
+                [local_start, local_end],
                 brush=self._overlay_brush_for_labels(segment.labels, selected=False),
                 seg_id=segment.id,
             )
@@ -190,31 +273,36 @@ class SegmentsMixin:
 
     def on_list_selection(self: Any, row: int) -> None:
         """
-        When a segment is selected in the list, reflect it in the editors
-        and selection region.
+        When a visible segment is selected in the list, reflect it in the
+        editors and selection region.
+
+        The UI shows local chunk times. The stored segment uses absolute times.
         """
-        if not self.state or row < 0 or row >= len(self.state.segments):
+        segment = self._segment_for_visible_row(row)
+
+        if segment is None:
             self.list_labels.clear()
             return
 
-        segment = self.state.segments[row]
+        chunk_start = self._chunk_start()
+        chunk_end = self._chunk_end()
 
-        # Update edit fields.
-        self.spin_start.setValue(segment.t_start)
-        self.spin_end.setValue(segment.t_end)
+        local_start = max(float(segment.t_start), chunk_start) - chunk_start
+        local_end = min(float(segment.t_end), chunk_end) - chunk_start
+
+        self.spin_start.setValue(local_start)
+        self.spin_end.setValue(local_end)
         self.rebuild_label_list()
 
-        # Update visible selection region.
         self._blocking = True
-        self.region.setRegion((segment.t_start, segment.t_end))
-        self.sel_start.setValue(segment.t_start)
-        self.sel_end.setValue(segment.t_end)
+        self.region.setRegion((local_start, local_end))
+        self.sel_start.setValue(local_start)
+        self.sel_end.setValue(local_end)
         self.lbl_sel_delta.setText(
-            f"(Δ {(segment.t_end - segment.t_start):.2f} s)"
+            f"(Δ {(local_end - local_start):.2f} s)"
         )
         self._blocking = False
 
-        # Keep shift-click anchor in sync.
         self._selection_anchor_row = row
         self._update_overlay_selection_styles()
         self._reflect_labelbar()
@@ -224,6 +312,23 @@ class SegmentsMixin:
         Refresh label UI and waveform overlay styling when multi-selection changes.
         """
         self.rebuild_label_list()
+        self._update_overlay_selection_styles()
+        self._reflect_labelbar()
+
+    def clear_segment_selection_for_free_region(self: Any) -> None:
+        """
+        Clear the selected segment(s) when the user manually moves the free
+        selection region.
+
+        This makes the next label click create a new segment instead of editing
+        the previously selected segment.
+        """
+        self.list.blockSignals(True)
+        self.list.clearSelection()
+        self.list.setCurrentRow(-1)
+        self.list.blockSignals(False)
+
+        self.list_labels.clear()
         self._update_overlay_selection_styles()
         self._reflect_labelbar()
 
@@ -250,16 +355,14 @@ class SegmentsMixin:
 
     def _selected_segment_ids(self: Any) -> list[str]:
         """
-        Return IDs of selected segments.
+        Return IDs of selected visible segments.
         """
-        if not self.state:
-            return []
-
         ids: list[str] = []
 
         for row in self._selected_segment_rows():
-            if 0 <= row < len(self.state.segments):
-                ids.append(self.state.segments[row].id)
+            segment = self._segment_for_visible_row(row)
+            if segment is not None:
+                ids.append(segment.id)
 
         return ids
 
@@ -268,11 +371,8 @@ class SegmentsMixin:
         ids: list[str],
     ) -> None:
         """
-        Restore list selection by segment IDs.
+        Restore list selection by segment IDs within the current visible chunk.
         """
-        if not self.state:
-            return
-
         wanted = set(ids or [])
 
         self.list.blockSignals(True)
@@ -280,22 +380,29 @@ class SegmentsMixin:
 
         first_row = -1
 
-        for i, segment in enumerate(self.state.segments):
-            if segment.id in wanted:
-                item = self.list.item(i)
+        for row, segment_id in enumerate(getattr(self, "visible_segment_ids", [])):
+            if segment_id in wanted:
+                item = self.list.item(row)
                 if item is not None:
                     item.setSelected(True)
                     if first_row < 0:
-                        first_row = i
+                        first_row = row
 
         if first_row >= 0:
-            self.list.setCurrentRow(first_row)
+            model_index = self.list.model().index(first_row, 0)
+            selection_model = self.list.selectionModel()
+            if selection_model is not None:
+                selection_model.setCurrentIndex(
+                    model_index,
+                    QtCore.QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
 
         self.list.blockSignals(False)
 
         if first_row >= 0:
             self.on_list_selection(first_row)
         else:
+            self._update_overlay_selection_styles()
             self._reflect_labelbar()
 
     # ------------------------------------------------------------------
@@ -304,7 +411,7 @@ class SegmentsMixin:
 
     def remove_selected_label(self: Any) -> None:
         """
-        Remove the currently selected label from all selected segments.
+        Remove the currently selected label from all selected visible segments.
         Undoable.
         """
         if not self.state:
@@ -322,20 +429,19 @@ class SegmentsMixin:
         if not label_to_remove:
             return
 
-        rows = self._selected_segment_rows()
-        if not rows:
+        selected_ids = self._selected_segment_ids()
+        if not selected_ids:
             return
 
         before = self._segments_snapshot()
-        before_selection = self._selected_segment_ids()
+        before_selection = selected_ids
 
         changed = False
 
-        for row in rows:
-            if not (0 <= row < len(self.state.segments)):
+        for segment_id in selected_ids:
+            segment = self._segment_by_id(segment_id)
+            if segment is None:
                 continue
-
-            segment = self.state.segments[row]
 
             while label_to_remove in segment.labels:
                 segment.labels.remove(label_to_remove)
@@ -344,46 +450,46 @@ class SegmentsMixin:
         if not changed:
             return
 
-        after_selection = [
-            self.state.segments[row].id
-            for row in rows
-            if 0 <= row < len(self.state.segments)
-        ]
-
         self._commit_segments_edit(
             before,
             before_selection=before_selection,
-            after_selection=after_selection,
+            after_selection=selected_ids,
         )
         self.rebuild_label_list()
 
     def update_segment(self: Any) -> None:
         """
-        Save changes to the current segment.
+        Save changes to the current visible segment.
         Undoable.
 
-        This remains a single-segment edit. Multi-selected segments are not
-        batch-resized because that would make all selected segments overlap.
+        The UI uses local chunk times; stored times are converted to absolute
+        source-file times.
         """
         row = self.list.currentRow()
-        if not self.state or row < 0:
-            return
+        segment = self._segment_for_visible_row(row)
 
-        segment = self.state.segments[row]
+        if not self.state or segment is None:
+            return
 
         before = self._segments_snapshot()
         before_selection = self._selected_segment_ids()
 
-        new_a = snap_t(self.spin_start.value())
-        new_b = max(new_a + TIME_SNAP, snap_t(self.spin_end.value()))
+        chunk_duration = self._chunk_duration()
+
+        new_a_local = max(0.0, snap_t(self.spin_start.value()))
+        new_b_local = max(new_a_local + TIME_SNAP, snap_t(self.spin_end.value()))
+        new_b_local = min(chunk_duration, new_b_local)
+
+        new_a_abs = self._local_to_absolute(new_a_local)
+        new_b_abs = self._local_to_absolute(new_b_local)
 
         new_labels = [
             self.list_labels.item(i).text()
             for i in range(self.list_labels.count())
         ]
 
-        segment.t_start = new_a
-        segment.t_end = new_b
+        segment.t_start = new_a_abs
+        segment.t_end = new_b_abs
         segment.labels = new_labels
 
         self._commit_segments_edit(
@@ -395,18 +501,18 @@ class SegmentsMixin:
 
     def delete_selected(self: Any) -> None:
         """
-        Delete selected segment(s) after confirmation.
+        Delete selected visible segment(s) after confirmation.
         Supports multi-selection.
         Undoable.
         """
         if not self.state:
             return
 
-        rows = self._selected_segment_rows()
-        if not rows:
+        selected_ids = self._selected_segment_ids()
+        if not selected_ids:
             return
 
-        count = len(rows)
+        count = len(selected_ids)
         msg = (
             "Delete the selected segment?"
             if count == 1
@@ -422,24 +528,20 @@ class SegmentsMixin:
             return
 
         before = self._segments_snapshot()
-        before_selection = self._selected_segment_ids()
+        before_selection = selected_ids
 
-        next_row = min(rows)
+        selected_id_set = set(selected_ids)
 
-        for row in sorted(rows, reverse=True):
-            if 0 <= row < len(self.state.segments):
-                del self.state.segments[row]
-
-        after_selection: list[str] = []
-
-        if self.state.segments:
-            next_row = min(next_row, len(self.state.segments) - 1)
-            after_selection = [self.state.segments[next_row].id]
+        self.state.segments = [
+            segment
+            for segment in self.state.segments
+            if segment.id not in selected_id_set
+        ]
 
         self._commit_segments_edit(
             before,
             before_selection=before_selection,
-            after_selection=after_selection,
+            after_selection=[],
         )
 
     # ------------------------------------------------------------------
@@ -448,30 +550,24 @@ class SegmentsMixin:
 
     def rebuild_label_list(self: Any) -> None:
         """
-        Rebuild the small label list for selected segment(s).
-
-        Behavior:
-        - One selected segment: show that segment's labels.
-        - Multiple selected segments: show the union of all labels across
-          selected segments.
+        Rebuild the small label list for selected visible segment(s).
         """
         self.list_labels.clear()
 
         if not self.state:
             return
 
-        rows = self._selected_segment_rows()
-        if not rows:
+        selected_ids = self._selected_segment_ids()
+        if not selected_ids:
             return
 
         labels: list[str] = []
         seen: set[str] = set()
 
-        for row in rows:
-            if not (0 <= row < len(self.state.segments)):
+        for segment_id in selected_ids:
+            segment = self._segment_by_id(segment_id)
+            if segment is None:
                 continue
-
-            segment = self.state.segments[row]
 
             for label in segment.labels:
                 if label not in seen:
@@ -507,7 +603,7 @@ class SegmentsMixin:
     def _on_remove_label_btn(self: Any) -> None:
         """
         Remove the label associated with the clicked '×' button from all
-        selected segments.
+        selected visible segments.
         Undoable.
         """
         if not self.state:
@@ -521,20 +617,19 @@ class SegmentsMixin:
         if not label_to_remove:
             return
 
-        rows = self._selected_segment_rows()
-        if not rows:
+        selected_ids = self._selected_segment_ids()
+        if not selected_ids:
             return
 
         before = self._segments_snapshot()
-        before_selection = self._selected_segment_ids()
+        before_selection = selected_ids
 
         changed = False
 
-        for row in rows:
-            if not (0 <= row < len(self.state.segments)):
+        for segment_id in selected_ids:
+            segment = self._segment_by_id(segment_id)
+            if segment is None:
                 continue
-
-            segment = self.state.segments[row]
 
             while label_to_remove in segment.labels:
                 segment.labels.remove(label_to_remove)
@@ -543,16 +638,10 @@ class SegmentsMixin:
         if not changed:
             return
 
-        after_selection = [
-            self.state.segments[row].id
-            for row in rows
-            if 0 <= row < len(self.state.segments)
-        ]
-
         self._commit_segments_edit(
             before,
             before_selection=before_selection,
-            after_selection=after_selection,
+            after_selection=selected_ids,
         )
         self.rebuild_label_list()
 
@@ -695,17 +784,10 @@ class SegmentsMixin:
 
     def _current_segment_or_none(self: Any) -> Optional[Segment]:
         """
-        Return the currently selected Segment object, or None.
+        Return the currently selected visible Segment object, or None.
         """
-        if not self.state:
-            return None
-
         row = self.list.currentRow()
-
-        if 0 <= row < len(self.state.segments):
-            return self.state.segments[row]
-
-        return None
+        return self._segment_for_visible_row(row)
 
     def _create_segment(
         self: Any,
@@ -714,11 +796,14 @@ class SegmentsMixin:
     ) -> Segment:
         """
         Create and append a new segment for the current file.
+
+        Input times are local chunk times.
+        Stored times are absolute source-file times.
         """
         segment = Segment(
             id=str(uuid.uuid4()),
-            t_start=t_start,
-            t_end=t_end,
+            t_start=self._local_to_absolute(t_start),
+            t_end=self._local_to_absolute(t_end),
             labels=[],
         )
 
@@ -731,32 +816,36 @@ class SegmentsMixin:
         """
         Update the LabelBar toggle state.
 
-        For multiple selected segments, only labels present on all selected
-        segments are shown as active.
+        For multiple selected visible segments, only labels present on all
+        selected segments are shown as active.
         """
         if not self.state:
             self.labelbar.reflect_segment([])
             return
 
-        rows = self._selected_segment_rows()
+        selected_ids = self._selected_segment_ids()
 
-        if not rows:
+        if not selected_ids:
             self.labelbar.reflect_segment([])
             return
 
-        selected = [
-            self.state.segments[row]
-            for row in rows
-            if 0 <= row < len(self.state.segments)
+        selected_segments = [
+            self._segment_by_id(segment_id)
+            for segment_id in selected_ids
+        ]
+        selected_segments = [
+            segment
+            for segment in selected_segments
+            if segment is not None
         ]
 
-        if not selected:
+        if not selected_segments:
             self.labelbar.reflect_segment([])
             return
 
-        common = set(selected[0].labels)
+        common = set(selected_segments[0].labels)
 
-        for segment in selected[1:]:
+        for segment in selected_segments[1:]:
             common &= set(segment.labels)
 
         self.labelbar.reflect_segment(list(common))
@@ -769,10 +858,9 @@ class SegmentsMixin:
         """
         Add or remove a label.
 
-        Behavior:
-        - If one or more segments are selected, apply to all selected segments.
-        - If no segment is selected, create a segment from the current region.
-        - The whole operation is one undoable edit.
+        If visible segments are selected, apply to all selected visible segments.
+        If no segment is selected, create a new segment from the current local
+        chunk selection.
         """
         if not self.state:
             return
@@ -780,15 +868,15 @@ class SegmentsMixin:
         before = self._segments_snapshot()
         before_selection = self._selected_segment_ids()
 
-        rows = self._selected_segment_rows()
+        selected_ids = self._selected_segment_ids()
         affected_ids: list[str] = []
 
-        if rows:
-            for row in rows:
-                if not (0 <= row < len(self.state.segments)):
+        if selected_ids:
+            for segment_id in selected_ids:
+                segment = self._segment_by_id(segment_id)
+                if segment is None:
                     continue
 
-                segment = self.state.segments[row]
                 affected_ids.append(segment.id)
 
                 if checked:
@@ -801,7 +889,7 @@ class SegmentsMixin:
                         pass
 
         else:
-            # No selected segment: create one from the current region.
+            # No selected segment: create one from the current local region.
             a, b = self.region.getRegion()
             a = snap_t(a)  # type: ignore[arg-type]
             b = max(a + TIME_SNAP, snap_t(b))  # type: ignore[arg-type]
@@ -817,7 +905,6 @@ class SegmentsMixin:
             before_selection=before_selection,
             after_selection=affected_ids,
         )
-
     # ------------------------------------------------------------------
     # Auto segmentation
     # ------------------------------------------------------------------
@@ -841,7 +928,7 @@ class SegmentsMixin:
             label_options[0] if label_options else None,
         )
         default_len = float(
-            getattr(self, "_auto_seg_cfg", {}).get("length_s", 3.0)
+            getattr(self, "_auto_seg_cfg", {}).get("length_s", 1.0)
         )
         default_ovl = float(
             getattr(self, "_auto_seg_cfg", {}).get("overlap_s", 0.0)
@@ -876,13 +963,14 @@ class SegmentsMixin:
         auto_label: Optional[str] = None,
     ) -> None:
         """
-        Create fixed-length segments across the file, with optional overlap.
+        Create fixed-length segments across the current virtual chunk.
+        Stored times are absolute source-file times.
         Undoable.
         """
         if self.state is None or self.t is None or len(self.t) == 0:
             return
 
-        dur = float(self.t[-1])
+        dur = self._chunk_duration()
         snap = float(TIME_SNAP)
 
         len_ticks = max(1, int(round(seg_len / snap)))
@@ -905,16 +993,16 @@ class SegmentsMixin:
         while start_tick < total_ticks:
             end_tick = min(start_tick + len_ticks, total_ticks)
 
-            a = round(start_tick * snap, 2)
-            b = round(end_tick * snap, 2)
+            local_a = round(start_tick * snap, 2)
+            local_b = round(end_tick * snap, 2)
 
             labels = [auto_label] if auto_label else []
 
             new_segments.append(
                 Segment(
                     id=str(uuid.uuid4()),
-                    t_start=a,
-                    t_end=b,
+                    t_start=self._local_to_absolute(local_a),
+                    t_end=self._local_to_absolute(local_b),
                     labels=labels,
                 )
             )
@@ -925,7 +1013,13 @@ class SegmentsMixin:
         before_selection = self._selected_segment_ids()
 
         if replace:
-            self.state.segments = new_segments
+            # Replace only segments that overlap the current virtual chunk.
+            self.state.segments = [
+                segment
+                for segment in self.state.segments
+                if not self._segment_overlaps_current_chunk(segment)
+            ]
+            self.state.segments.extend(new_segments)
         else:
             self.state.segments.extend(new_segments)
 

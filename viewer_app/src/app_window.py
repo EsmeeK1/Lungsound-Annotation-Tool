@@ -6,7 +6,7 @@ from PySide6 import QtWidgets
 
 from .app_settings import DEFAULT_SR, load_prefs, UserPrefs
 from .audio_playback import Player
-from .data_models import FileState
+from .data_models import AudioItem, FileState
 from .controllers.ui_builder import UiBuilderMixin
 from .controllers.shortcuts import ShortcutsMixin
 from .controllers.audio_view import AudioViewMixin
@@ -37,13 +37,15 @@ class App(
         self.prefs: UserPrefs = load_prefs()
 
         self.root = ""
-        self.files: List[str] = []
+        self.files: List[AudioItem] = []
+        self.current_item: Optional[AudioItem] = None
         self.idx = -1
 
         self.y_raw: Optional[np.ndarray] = None
         self.sr = DEFAULT_SR
         self.t: Optional[np.ndarray] = None
         self.state: Optional[FileState] = None
+        self.visible_segment_ids: list[str] = []
 
         self.overlay_regions: Dict[str, pg.LinearRegionItem] = {}
         self._blocking = False
