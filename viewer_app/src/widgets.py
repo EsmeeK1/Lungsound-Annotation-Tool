@@ -38,17 +38,11 @@ class ClickableRegion(pg.LinearRegionItem):
 
 class MetadataInlineEditor(QtWidgets.QWidget):
     """
-    Inline editor for recording metadata.
+    Inline editor for generic recording metadata.
 
-    UI map:
-      group box: "Recording metadata"
-        - Subject ID: QLineEdit, accepts "001" or "P001"
-        - Microphone type: editable QComboBox (supports recent items)
-        - Sample Rate: QSpinBox in Hz
-        - Recording location: editable QComboBox (supports recent items)
-
-    Signals:
-      - changed(dict): emitted whenever a field is edited, returns current values
+    Fields:
+      - environment
+      - notes
     """
 
     changed = QtCore.Signal(dict)
@@ -63,141 +57,130 @@ class MetadataInlineEditor(QtWidgets.QWidget):
         form.setContentsMargins(8, 8, 8, 8)
         form.setSpacing(6)
 
-        # subject id, accepts "001" or "P001"
-        w_subject = QtWidgets.QLineEdit()
-        w_subject.setPlaceholderText("001 or P001")
-        w_subject.setValidator(QRegularExpressionValidator(QRegularExpression(r"^(P?\d{3})$")))
-        w_subject.editingFinished.connect(self._emit)
-        self._widgets["subject_id"] = w_subject
-        form.addRow("Subject ID:", w_subject)
+        # Environment
+        w_env = QtWidgets.QComboBox()
+        w_env.setEditable(True)
+        w_env.addItems([
+            "",
+            "indoor",
+            "outdoor",
+            "quiet",
+            "noisy",
+            "traffic",
+            "home",
+            "lab",
+            "clinical",
+            "other",
+        ])
+        w_env.lineEdit().editingFinished.connect(self._emit)  # type: ignore
+        w_env.currentTextChanged.connect(lambda *_: self._emit())
+        self._widgets["environment"] = w_env
+        form.addRow("Environment:", w_env)
 
-        # microphone type, editable combobox so users can type or pick
-        w_mic = QtWidgets.QComboBox()
-        w_mic.setEditable(True)
-        w_mic.lineEdit().editingFinished.connect(self._emit)  # type: ignore
-        self._widgets["microphone_type"] = w_mic
-        form.addRow("Microphone type:", w_mic)
-
-        # sample rate in Hz
-        w_sr = QtWidgets.QSpinBox()
-        w_sr.setRange(0, 384000)
-        w_sr.setSingleStep(100)
-        w_sr.valueChanged.connect(self._emit)
-        self._widgets["sample_rate"] = w_sr
-        form.addRow("Sample Rate:", w_sr)
-
-        # recording location, editable to allow custom entries
-        w_loc = QtWidgets.QComboBox()
-        w_loc.setEditable(True)
-        w_loc.lineEdit().editingFinished.connect(self._emit)  # type: ignore
-        self._widgets["location"] = w_loc
-        form.addRow("Recording location:", w_loc)
+        # Notes
+        w_notes = QtWidgets.QLineEdit()
+        w_notes.setPlaceholderText("Optional notes")
+        w_notes.editingFinished.connect(self._emit)
+        self._widgets["notes"] = w_notes
+        form.addRow("Notes:", w_notes)
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(box)
 
-    # recent-items helpers
-
     def set_recent_mics(self, items: _t.Sequence[str]):
         """
-        Replace microphone recent items while keeping the current text.
+        Kept for backward compatibility with mainwindow.py.
+        No longer used.
         """
-        cb: QtWidgets.QComboBox = _t.cast(QtWidgets.QComboBox, self._widgets["microphone_type"])
-        txt = cb.currentText()
-        cb.blockSignals(True)
-        cb.clear()
-        cb.addItems(list(items))
-        cb.setCurrentText(txt)
-        cb.blockSignals(False)
+        return
 
     def set_recent_locations(self, items: _t.Sequence[str]):
         """
-        Replace location recent items while keeping the current text.
+        Reuse the existing location-recents pipeline for environment suggestions.
         """
-        cb: QtWidgets.QComboBox = _t.cast(QtWidgets.QComboBox, self._widgets["location"])
-        txt = cb.currentText()
-        cb.blockSignals(True)
-        cb.clear()
-        cb.addItems(list(items))
-        cb.setCurrentText(txt)
-        cb.blockSignals(False)
+        if "environment" not in self._widgets:
+            return
 
-    # existing api
+        cb: QtWidgets.QComboBox = _t.cast(QtWidgets.QComboBox, self._widgets["environment"])
+        txt = cb.currentText()
+
+        cb.blockSignals(True)
+
+        base_items = [
+            "",
+            "indoor",
+            "outdoor",
+            "quiet",
+            "noisy",
+            "traffic",
+            "home",
+            "lab",
+            "clinical",
+            "other",
+        ]
+
+        merged = list(dict.fromkeys(base_items + list(items or [])))
+
+        cb.clear()
+        cb.addItems(merged)
+        cb.setCurrentText(txt)
+
+        cb.blockSignals(False)
 
     def set_values(self, meta: dict | None):
         """
-        Fill the widgets from a metadata dict.
-        Only sets fields that are present.
+        Fill widgets from metadata.
+
+        Supports old keys for migration:
+        - location -> environment
         """
-        meta = meta or {}
+        meta = dict(meta or {})
 
-        # subject id
-        self._widgets["subject_id"].blockSignals(True)
-        self._widgets["subject_id"].setText(str(meta.get("subject_id", "")))  # type: ignore
-        self._widgets["subject_id"].blockSignals(False)
+        # Backward compatibility: old location can become environment.
+        if "environment" not in meta and meta.get("location"):
+            meta["environment"] = meta.get("location")
 
-        # microphone type
-        cb_m: QtWidgets.QComboBox = _t.cast(QtWidgets.QComboBox, self._widgets["microphone_type"])
-        cb_m.blockSignals(True)
-        cb_m.setCurrentText(str(meta.get("microphone_type", "")))
-        cb_m.blockSignals(False)
+        for key, widget in self._widgets.items():
+            value = meta.get(key, "")
 
-        # sample rate, coerce to int and use 0 for empty/invalid
-        sr = meta.get("sample_rate", "")
-        try:
-            sr = int(sr) if str(sr).strip() != "" else 0
-        except Exception:
-            sr = 0
-        self._widgets["sample_rate"].blockSignals(True)
-        self._widgets["sample_rate"].setValue(sr)  # type: ignore
-        self._widgets["sample_rate"].blockSignals(False)
+            widget.blockSignals(True)
 
-        # recording location
-        cb_l: QtWidgets.QComboBox = _t.cast(QtWidgets.QComboBox, self._widgets["location"])
-        current_items = [cb_l.itemText(i) for i in range(cb_l.count())]
-        current_value = str(meta.get("location", ""))
+            if isinstance(widget, QtWidgets.QLineEdit):
+                widget.setText(str(value or ""))
 
-        # if current value is not in the list, add it without clearing the list
-        cb_l.blockSignals(True)
-        if current_value and current_value not in current_items:
-            cb_l.addItem(current_value)
-        cb_l.setCurrentText(current_value)
-        cb_l.blockSignals(False)
+            elif isinstance(widget, QtWidgets.QComboBox):
+                text = str(value or "")
+                current_items = [widget.itemText(i) for i in range(widget.count())]
+                if text and text not in current_items:
+                    widget.addItem(text)
+                widget.setCurrentText(text)
+
+            widget.blockSignals(False)
 
     def values(self) -> dict:
         """
-        Collect current values from the editor.
+        Collect current values.
+
         Empty fields are omitted.
         """
         out: dict = {}
 
-        # subject id
-        t = self._widgets["subject_id"].text().strip()  # type: ignore
-        if t:
-            out["subject_id"] = t
+        for key, widget in self._widgets.items():
+            if isinstance(widget, QtWidgets.QLineEdit):
+                value = widget.text().strip()
+                if value:
+                    out[key] = value
 
-        # microphone type
-        cb_m: QtWidgets.QComboBox = _t.cast(QtWidgets.QComboBox, self._widgets["microphone_type"])
-        m = cb_m.currentText().strip()
-        if m:
-            out["microphone_type"] = m
-
-        # sample rate
-        sr = int(self._widgets["sample_rate"].value())  # type: ignore
-        if sr > 0:
-            out["sample_rate"] = sr
-
-        # recording location
-        cb_l: QtWidgets.QComboBox = _t.cast(QtWidgets.QComboBox, self._widgets["location"])
-        loc = cb_l.currentText().strip()
-        if loc:
-            out["location"] = loc
+            elif isinstance(widget, QtWidgets.QComboBox):
+                value = widget.currentText().strip()
+                if value:
+                    out[key] = value
 
         return out
 
     def _emit(self):
         """
-        Emit 'changed' with the current values.
+        Emit changed metadata.
         """
         self.changed.emit(self.values())
 
