@@ -187,6 +187,12 @@ class App(QtWidgets.QMainWindow):
         # segments list
         rv.addWidget(QtWidgets.QLabel("Segments"))
         self.list = QtWidgets.QListWidget()
+
+        # Allow normal multi-select behavior:
+        # - Shift-click selects a range
+        # - Ctrl-click toggles individual rows
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+
         rv.addWidget(self.list, 1)
 
         # edit segment group
@@ -271,8 +277,14 @@ class App(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Enter"), self, self.update_segment)
         QtGui.QShortcut(QtGui.QKeySequence("Delete"), self, self.delete_selected)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.reset_view)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self, self.undo)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Y"), self, self.redo)
+
+        sc_undo = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
+        sc_undo.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        sc_undo.activated.connect(self.undo)
+
+        sc_redo = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Y"), self)
+        sc_redo.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        sc_redo.activated.connect(self.redo)
 
         for seq, cb in [
             ("Left",        lambda: self.nudge_region(-TIME_SNAP, "move")),
@@ -293,6 +305,7 @@ class App(QtWidgets.QMainWindow):
         self.btn_remove_label.clicked.connect(self.remove_selected_label)
         self.region.sigRegionChanged.connect(self.on_region_changed)
         self.list.currentRowChanged.connect(self.on_list_selection)
+        self.list.itemSelectionChanged.connect(self.on_segment_selection_changed)
         self.btn_update.clicked.connect(self.update_segment)
         self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_export_csv.clicked.connect(self.export_csv)
@@ -760,46 +773,79 @@ class App(QtWidgets.QMainWindow):
         """
         Update file metadata when the inline editor changes.
 
-        Steps:
-        1) Normalize subject_id if present.
-        2) Merge into current state and save JSON.
-        3) Update recent mic/location lists.
+        Only environment and notes are stored.
+        Empty fields are removed.
+
+        Environment is also saved as a session default, so the next loaded file
+        automatically gets the last used environment unless it already has one.
         """
         if not self.state:
             return
 
         vals = dict(values or {})
 
-        # normalize subject ID if provided
-        sid = vals.get("subject_id", "")
-        if sid:
-            try:
-                vals["subject_id"] = normalize_subject_id(str(sid))
-            except Exception:
-                # leave as-is in the UI; the editor already validates input
-                pass
+        # Keep only the metadata fields we still support.
+        vals = {
+            k: v
+            for k, v in vals.items()
+            if k in METADATA_FIELDS and str(v).strip() != ""
+        }
 
-        # merge and persist
         self.state.meta = dict(self.state.meta or {})
+
+        # Remove managed metadata fields first, so clearing a field removes it.
+        for k in METADATA_FIELDS:
+            self.state.meta.pop(k, None)
+
+        # Remove old metadata keys from previous versions.
+        for old_key in ("subject_id", "microphone_type", "sample_rate", "location"):
+            self.state.meta.pop(old_key, None)
+
         self.state.meta.update(vals)
+
+        # Session default: remember last environment for the next files.
+        if vals.get("environment"):
+            self.session_meta["environment"] = vals["environment"]
+            self.bump_recents(loc=str(vals["environment"]))
+
         self.save_json()
 
-        # update recents
-        self.bump_recents(vals.get("microphone_type"), vals.get("location"))
-
     # segment list and overlays
+    def _sort_segments_chronologically(self):
+        """
+        Keep segments ordered from low to high time.
+
+        Sort order:
+        1. start time
+        2. end time
+        3. id as stable fallback
+        """
+        if not self.state:
+            return
+
+        self.state.segments.sort(
+            key=lambda s: (
+                float(s.t_start),
+                float(s.t_end),
+                str(s.id),
+            )
+        )
+
     def refresh_segment_list(self):
         """
         Rebuild the segment list and overlay regions on the waveform.
 
         Steps:
-        1) Clear list and remove old overlay items.
-        2) Add each segment to the list and create a clickable region.
-        3) Reflect the label bar toggle state.
+        1) Sort segments chronologically.
+        2) Clear list and remove old overlay items.
+        3) Add each segment to the list and create a clickable region.
+        4) Reflect the label bar toggle state.
         """
         self.list.clear()
         if not self.state:
             return
+
+        self._sort_segments_chronologically()
 
         # remove old overlays safely
         for reg in getattr(self, "overlay_regions", {}).values():
@@ -856,70 +902,147 @@ class App(QtWidgets.QMainWindow):
         self._blocking = False
 
         # update label bar toggles
+        self._selection_anchor_row = row
+        self._reflect_labelbar()
+
+    def on_segment_selection_changed(self):
+        """
+        Refresh label UI when the multi-selection changes.
+        """
+        self.rebuild_label_list()
         self._reflect_labelbar()
 
     def remove_selected_label(self):
         """
-        Remove the currently selected label from the selected segment.
+        Remove the currently selected label from all selected segments.
+        Undoable.
         """
-        row = self.list.currentRow()
-        if not self.state or row < 0:
+        if not self.state:
             return
 
-        s = self.state.segments[row]
         lab_row = self.list_labels.currentRow()
-        if lab_row < 0 or lab_row >= len(s.labels):
+        if lab_row < 0 or lab_row >= self.list_labels.count():
             return
 
-        del s.labels[lab_row]
+        item = self.list_labels.item(lab_row)
+        if item is None:
+            return
 
-        # refresh UI and save
-        self.on_list_selection(row)
-        self.refresh_segment_list()
-        self.save_json()
+        label_to_remove = item.text().strip()
+        if not label_to_remove:
+            return
+
+        rows = self._selected_segment_rows()
+        if not rows:
+            return
+
+        before = self._segments_snapshot()
+        before_selection = self._selected_segment_ids()
+
+        changed = False
+
+        for row in rows:
+            if not (0 <= row < len(self.state.segments)):
+                continue
+
+            seg = self.state.segments[row]
+
+            while label_to_remove in seg.labels:
+                seg.labels.remove(label_to_remove)
+                changed = True
+
+        if not changed:
+            return
+
+        after_selection = [
+            self.state.segments[row].id
+            for row in rows
+            if 0 <= row < len(self.state.segments)
+        ]
+
+        self._commit_segments_edit(
+            before,
+            before_selection=before_selection,
+            after_selection=after_selection,
+        )
         self.rebuild_label_list()
 
     def update_segment(self):
         """
-        Save changes to the selected segment (bounds and label list).
+        Save changes to the selected segment.
+        Undoable.
+
+        Note:
+        - This remains a single-segment edit.
+        - Multi-selected segments are not batch-resized here, because that would be ambiguous.
         """
         row = self.list.currentRow()
         if not self.state or row < 0:
             return
 
         s = self.state.segments[row]
+
+        before = self._segments_snapshot()
+        before_selection = self._selected_segment_ids()
 
         # sanitize and snap bounds
         new_a = snap_t(self.spin_start.value())
         new_b = max(new_a + TIME_SNAP, snap_t(self.spin_end.value()))
 
         # collect labels from the list widget
-        new_labels = [self.list_labels.item(i).text() for i in range(self.list_labels.count())]
+        new_labels = [
+            self.list_labels.item(i).text()
+            for i in range(self.list_labels.count())
+        ]
 
-        # write back
         s.t_start, s.t_end, s.labels = new_a, new_b, new_labels
 
-        # refresh UI and persist
-        self.refresh_segment_list()
-        self.list.setCurrentRow(row)
-        self.save_json()
+        self._commit_segments_edit(
+            before,
+            before_selection=before_selection,
+            after_selection=[s.id],
+        )
         self.rebuild_label_list()
 
     def delete_selected(self):
         """
-        Delete the selected segment after confirmation.
+        Delete selected segment(s) after confirmation.
+        Supports multi-selection.
+        Undoable.
         """
-        row = self.list.currentRow()
-        if not self.state or row < 0:
+        if not self.state:
             return
 
-        ans = QtWidgets.QMessageBox.question(self, "Delete segment", "Delete the selected segment?")
+        rows = self._selected_segment_rows()
+        if not rows:
+            return
+
+        count = len(rows)
+        msg = "Delete the selected segment?" if count == 1 else f"Delete {count} selected segments?"
+
+        ans = QtWidgets.QMessageBox.question(self, "Delete segment", msg)
         if ans != QtWidgets.QMessageBox.Yes:  # type: ignore
             return
 
-        del self.state.segments[row]
-        self.refresh_segment_list()
-        self.save_json()
+        before = self._segments_snapshot()
+        before_selection = self._selected_segment_ids()
+
+        # Pick a sensible row to select after deletion.
+        next_row = min(rows)
+        for row in sorted(rows, reverse=True):
+            if 0 <= row < len(self.state.segments):
+                del self.state.segments[row]
+
+        after_selection: list[str] = []
+        if self.state.segments:
+            next_row = min(next_row, len(self.state.segments) - 1)
+            after_selection = [self.state.segments[next_row].id]
+
+        self._commit_segments_edit(
+            before,
+            before_selection=before_selection,
+            after_selection=after_selection,
+        )
 
     # navigation combo
     def _rel_display_name(self, abspath: str) -> str:
@@ -999,18 +1122,28 @@ class App(QtWidgets.QMainWindow):
             except Exception:
                 continue
 
-            for s in st.segments:
-                rows.append({
+            for s in sorted(st.segments, key=lambda s: (float(s.t_start), float(s.t_end), str(s.id))):
+                row = {
                     "date": today,
                     "filename": self._rel_display_name(fp),
                     "t_start": s.t_start,
                     "t_end": s.t_end,
                     "label": ";".join(s.labels),
-                    "subject_id": st.meta.get("subject_id", ""),
-                    "microphone_type": st.meta.get("microphone_type", ""),
-                    "sample_rate": st.meta.get("sample_rate", ""),
-                    "location": st.meta.get("location", ""),
-                })
+                }
+
+                meta = dict(st.meta or {})
+
+                # Backward compatibility: old location can become environment.
+                if "environment" not in meta and meta.get("location"):
+                    meta["environment"] = meta.get("location")
+
+                # Only include filled supported metadata fields.
+                for key in METADATA_FIELDS:
+                    value = meta.get(key, "")
+                    if str(value).strip() != "":
+                        row[key] = value
+
+                rows.append(row)
 
         if not rows:
             QtWidgets.QMessageBox.information(self, "Export", "No segments to export.")
@@ -1061,9 +1194,20 @@ class App(QtWidgets.QMainWindow):
 
     def _refresh_location_choices(self):
         """
-        Rebuild the location dropdown from defaults + recents, without duplicates.
+        Rebuild the environment dropdown from defaults + recent environments.
         """
-        defaults = load_default_locations(self.labelset_combo.currentText())
+        defaults = [
+            "",
+            "indoor",
+            "outdoor",
+            "quiet",
+            "noisy",
+            "traffic",
+            "home",
+            "lab",
+            "clinical",
+            "other",
+        ]
         merged = list(dict.fromkeys(defaults + self.prefs.recents_locations))
         self.meta_inline.set_recent_locations(merged)
 
@@ -1194,21 +1338,37 @@ class App(QtWidgets.QMainWindow):
     # label list (inside the edit group)
     def rebuild_label_list(self):
         """
-        Rebuild the small list of labels for the currently selected segment.
+        Rebuild the small list of labels for the selected segment(s).
 
-        Steps:
-        1) Clear the list when no segment is selected.
-        2) For each label, add a row with a remove button.
+        Behavior:
+        - If one segment is selected: show that segment's labels.
+        - If multiple segments are selected: show the union of all labels
+          across selected segments.
         """
         self.list_labels.clear()
-        row = self.list.currentRow()
-        if not self.state or row < 0 or row >= len(self.state.segments):
+
+        if not self.state:
             return
 
-        seg = self.state.segments[row]
+        rows = self._selected_segment_rows()
+        if not rows:
+            return
 
-        for L in seg.labels:
-            # create a row item with a compact widget inside
+        # Build a stable union of labels across all selected segments.
+        labels: list[str] = []
+        seen: set[str] = set()
+
+        for row in rows:
+            if not (0 <= row < len(self.state.segments)):
+                continue
+
+            seg = self.state.segments[row]
+            for L in seg.labels:
+                if L not in seen:
+                    labels.append(L)
+                    seen.add(L)
+
+        for L in labels:
             item = QtWidgets.QListWidgetItem(self.list_labels)
             item.setSizeHint(QtCore.QSize(0, 26))
 
@@ -1220,7 +1380,7 @@ class App(QtWidgets.QMainWindow):
             lbl = QtWidgets.QLabel(L)
             btn = QtWidgets.QToolButton()
             btn.setText("×")
-            btn.setToolTip(f"Remove label: {L}")
+            btn.setToolTip(f"Remove label from selected segment(s): {L}")
             btn.setFixedSize(22, 22)
             btn.setStyleSheet("QToolButton { font-weight: bold; }")
             btn.setProperty("label_text", L)
@@ -1235,7 +1395,9 @@ class App(QtWidgets.QMainWindow):
 
     def _on_remove_label_btn(self):
         """
-        Remove the label associated with the clicked '×' button from the current segment.
+        Remove the label associated with the clicked '×' button
+        from all selected segments.
+        Undoable.
         """
         if not self.state:
             return
@@ -1244,22 +1406,44 @@ class App(QtWidgets.QMainWindow):
         if not isinstance(sender, QtWidgets.QToolButton):
             return
 
-        L = sender.property("label_text")
-        row = self.list.currentRow()
-        if row < 0 or row >= len(self.state.segments):
+        label_to_remove = str(sender.property("label_text") or "").strip()
+        if not label_to_remove:
             return
 
-        seg = self.state.segments[row]
-        try:
-            seg.labels.remove(L)
-        except ValueError:
+        rows = self._selected_segment_rows()
+        if not rows:
             return
 
-        # refresh UI and persist
+        before = self._segments_snapshot()
+        before_selection = self._selected_segment_ids()
+
+        changed = False
+
+        for row in rows:
+            if not (0 <= row < len(self.state.segments)):
+                continue
+
+            seg = self.state.segments[row]
+
+            while label_to_remove in seg.labels:
+                seg.labels.remove(label_to_remove)
+                changed = True
+
+        if not changed:
+            return
+
+        after_selection = [
+            self.state.segments[row].id
+            for row in rows
+            if 0 <= row < len(self.state.segments)
+        ]
+
+        self._commit_segments_edit(
+            before,
+            before_selection=before_selection,
+            after_selection=after_selection,
+        )
         self.rebuild_label_list()
-        self.refresh_segment_list()
-        self.list.setCurrentRow(row)
-        self.save_json()
 
     # persistence and navigation
 
@@ -1286,6 +1470,149 @@ class App(QtWidgets.QMainWindow):
         self.idx = new
         self.load_current()
         self._after_navigation_changed()
+
+        # global segment selection + undo helpers
+
+    def _selected_segment_rows(self) -> list[int]:
+        """
+        Return all selected segment rows, sorted.
+        Falls back to the current row when nothing is explicitly selected.
+        """
+        rows = sorted({
+            idx.row()
+            for idx in self.list.selectedIndexes()
+            if idx.isValid()
+        })
+
+        if rows:
+            return rows
+
+        row = self.list.currentRow()
+        if self.state and 0 <= row < len(self.state.segments):
+            return [row]
+
+        return []
+
+    def _selected_segment_ids(self) -> list[str]:
+        """
+        Return IDs of selected segments.
+        """
+        if not self.state:
+            return []
+
+        ids: list[str] = []
+        for row in self._selected_segment_rows():
+            if 0 <= row < len(self.state.segments):
+                ids.append(self.state.segments[row].id)
+        return ids
+
+    def _set_selected_segment_ids(self, ids: list[str]) -> None:
+        """
+        Restore list selection by segment IDs.
+        """
+        if not self.state:
+            return
+
+        wanted = set(ids or [])
+
+        self.list.blockSignals(True)
+        self.list.clearSelection()
+
+        first_row = -1
+        for i, seg in enumerate(self.state.segments):
+            if seg.id in wanted:
+                item = self.list.item(i)
+                if item is not None:
+                    item.setSelected(True)
+                    if first_row < 0:
+                        first_row = i
+
+        if first_row >= 0:
+            self.list.setCurrentRow(first_row)
+
+        self.list.blockSignals(False)
+
+        if first_row >= 0:
+            self.on_list_selection(first_row)
+        else:
+            self._reflect_labelbar()
+
+    def _segments_snapshot(self) -> list[Segment]:
+        """
+        Deep-copy all segments so undo/redo can restore exact state.
+        """
+        if not self.state:
+            return []
+
+        return [
+            Segment(
+                id=s.id,
+                t_start=s.t_start,
+                t_end=s.t_end,
+                labels=list(s.labels),
+            )
+            for s in self.state.segments
+        ]
+
+    def _restore_segments_snapshot(self, snapshot: list[Segment], selected_ids: list[str] | None = None) -> None:
+        """
+        Restore segments from a snapshot and refresh UI/persistence.
+        """
+        if not self.state:
+            return
+
+        self.state.segments = [
+            Segment(
+                id=s.id,
+                t_start=s.t_start,
+                t_end=s.t_end,
+                labels=list(s.labels),
+            )
+            for s in snapshot
+        ]
+
+        self.refresh_segment_list()
+        self._set_selected_segment_ids(selected_ids or [])
+        self._reflect_labelbar()
+        self.save_json()
+
+    def _commit_segments_edit(
+        self,
+        before: list[Segment],
+        before_selection: list[str] | None = None,
+        after_selection: list[str] | None = None,
+    ) -> None:
+        """
+        Commit the current segment state as one undoable edit.
+        Call this after mutating self.state.segments.
+        """
+        if not self.state:
+            return
+
+        after = self._segments_snapshot()
+
+        if before == after:
+            self.refresh_segment_list()
+            self._reflect_labelbar()
+            self.save_json()
+            return
+
+        before_selection = before_selection or []
+        after_selection = after_selection or self._selected_segment_ids()
+
+        def do():
+            self._restore_segments_snapshot(after, after_selection)
+
+        def undo():
+            self._restore_segments_snapshot(before, before_selection)
+
+        self._undo_stack.append((do, undo))
+        self._redo_stack.clear()
+
+        self.refresh_segment_list()
+        self._set_selected_segment_ids(after_selection)
+        self._reflect_labelbar()
+        self.save_json()
 
     # undo/redo helpers
     def _push_edit(self, do: Callable[[], None], undo: Callable[[], None]):
@@ -1352,54 +1679,92 @@ class App(QtWidgets.QMainWindow):
 
     def _reflect_labelbar(self):
         """
-        Update the LabelBar toggle state to match the current segment labels.
+        Update the LabelBar toggle state.
+
+        For one selected segment:
+        - show that segment's labels.
+
+        For multiple selected segments:
+        - show only labels that are present on all selected segments.
+          This prevents ambiguous partial states.
         """
-        seg = self._current_segment_or_none()
-        self.labelbar.reflect_segment(seg.labels if seg else [])
+        if not self.state:
+            self.labelbar.reflect_segment([])
+            return
+
+        rows = self._selected_segment_rows()
+
+        if not rows:
+            self.labelbar.reflect_segment([])
+            return
+
+        selected = [
+            self.state.segments[r]
+            for r in rows
+            if 0 <= r < len(self.state.segments)
+        ]
+
+        if not selected:
+            self.labelbar.reflect_segment([])
+            return
+
+        common = set(selected[0].labels)
+        for seg in selected[1:]:
+            common &= set(seg.labels)
+
+        self.labelbar.reflect_segment(list(common))
 
     def _on_labelbar_toggled(self, label: str, checked: bool):
         """
-        Add or remove a label on the current segment when a LabelBar button is toggled.
+        Add or remove a label.
 
-        If no segment is selected, create one from the current region first.
-        Uses the undo/redo stack.
+        Behavior:
+        - If one or more segments are selected, apply to all selected segments.
+        - If no segment is selected, create a segment from the current region.
+        - The whole operation is one undoable edit.
         """
         if not self.state:
             return
 
-        seg = self._current_segment_or_none()
-        if seg is None:
-            # no current segment, create one from the selection
-            a, b = self.region.getRegion()
-            a = snap_t(a) # type: ignore
-            b = max(a + TIME_SNAP, snap_t(b))  # type: ignore
-            seg = self._create_segment(a, b)
-            self.list.setCurrentRow(len(self.state.segments) - 1)
+        before = self._segments_snapshot()
+        before_selection = self._selected_segment_ids()
 
-        def do_add():
-            if label not in seg.labels:
-                seg.labels.append(label)
+        rows = self._selected_segment_rows()
+        affected_ids: list[str] = []
 
-        def undo_add():
-            try:
-                seg.labels.remove(label)
-            except ValueError:
-                pass
+        if rows:
+            for row in rows:
+                if not (0 <= row < len(self.state.segments)):
+                    continue
 
-        def do_remove():
-            try:
-                seg.labels.remove(label)
-            except ValueError:
-                pass
+                seg = self.state.segments[row]
+                affected_ids.append(seg.id)
 
-        def undo_remove():
-            if label not in seg.labels:
-                seg.labels.append(label)
-
-        if checked:
-            self._push_edit(do_add, undo_add)
+                if checked:
+                    if label not in seg.labels:
+                        seg.labels.append(label)
+                else:
+                    try:
+                        seg.labels.remove(label)
+                    except ValueError:
+                        pass
         else:
-            self._push_edit(do_remove, undo_remove)
+            # No selected segment: create one from the current region.
+            a, b = self.region.getRegion()
+            a = snap_t(a)  # type: ignore
+            b = max(a + TIME_SNAP, snap_t(b))  # type: ignore
+
+            seg = self._create_segment(a, b)
+            affected_ids.append(seg.id)
+
+            if checked and label not in seg.labels:
+                seg.labels.append(label)
+
+        self._commit_segments_edit(
+            before,
+            before_selection=before_selection,
+            after_selection=affected_ids,
+        )
 
 
     # play current segment
@@ -1448,12 +1813,13 @@ class App(QtWidgets.QMainWindow):
 
     def open_folder_dialog(self, first=False):
         """
-        Show the start dialog, collect root and metadata, then load files.
+        Show the start dialog, collect the dataset root, then load files.
 
         Steps:
-        1) Open StartDialog and capture root + metadata.
-        2) Update recents from chosen mic/location.
-        3) Load labels/defaults, build file queue, and set up UI.
+        1) Open StartDialog and capture root.
+        2) Load labels/defaults, build file queue, and set up UI.
+
+        Metadata is edited inline in the main window.
         """
         self.player.stop()
         dlg = StartDialog(self)
@@ -1463,17 +1829,12 @@ class App(QtWidgets.QMainWindow):
         try:
             # 1) save chosen root and metadata
             self.root = dlg.root or ""
-            self.session_meta = dlg.get_meta()
 
-            # 2) recents handling
-            mic = self.session_meta.get("microphone_type", "")
-            loc = self.session_meta.get("location", "")
-            if mic:
-                self.bump_recents(mic=mic)  # type: ignore
-            if loc:
-                self.bump_recents(loc=loc)  # type: ignore
+            # Metadata is now handled inline per file.
+            # Session metadata is only used to carry over the last environment.
+            self.session_meta = {}
 
-            # 3) load labels, find files, and initialize UI
+            # 2) load labels, find files, and initialize UI
             self.load_labels_json()
             self.build_file_queue(self.root)
             print(f"[DEBUG] open_folder_dialog: root={self.root} files={len(self.files)}")
@@ -1486,6 +1847,7 @@ class App(QtWidgets.QMainWindow):
             self.idx = 0
             self.load_current()
             self._after_navigation_changed()
+
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1620,11 +1982,19 @@ class App(QtWidgets.QMainWindow):
             else:
                 self.state = FileState(file=os.path.basename(f), sr=self.sr, meta=dict(self.session_meta), segments=[])
 
-            # ensure meta is a dict and merge defaults
+            # ensure meta is a dict and merge supported session defaults
             if not isinstance(self.state.meta, dict):
                 self.state.meta = {}
+
+            # Clean old metadata keys from previous versions.
+            for old_key in ("subject_id", "microphone_type", "sample_rate", "location"):
+                self.state.meta.pop(old_key, None)
+
+            # Apply session default only for supported metadata fields.
+            # This makes the last used environment carry over to the next file.
             for k, v in (self.session_meta or {}).items():
-                self.state.meta.setdefault(k, v)
+                if k in METADATA_FIELDS and str(v).strip() != "":
+                    self.state.meta.setdefault(k, v)
 
             # 5) reflect metadata and labels into UI
             meta_for_editor = {k: self.state.meta.get(k, "") for k in METADATA_FIELDS}
@@ -1689,9 +2059,10 @@ class App(QtWidgets.QMainWindow):
         """
         Select a segment by clicking its overlay region on the waveform.
 
-        Steps:
-        1) Find the matching segment by ID.
-        2) Select it in the list and reflect selection in the region and spins.
+        Behavior:
+        - Normal click: select only this segment.
+        - Shift-click: select range from the last clicked segment to this segment.
+        - Ctrl-click: toggle this segment in the current selection.
         """
         if self.state is None:
             return
@@ -1700,18 +2071,62 @@ class App(QtWidgets.QMainWindow):
         if try_id is None:
             return
 
+        clicked_row = -1
         for i, s in enumerate(self.state.segments):
             if s.id == try_id:
-                self.list.setCurrentRow(i)
-
-                # reflect selection to region and delta label
-                self._blocking = True
-                self.region.setRegion((s.t_start, s.t_end))
-                self.sel_start.setValue(s.t_start)
-                self.sel_end.setValue(s.t_end)
-                self.lbl_sel_delta.setText(f"(Δ {(s.t_end - s.t_start):.2f} s)")
-                self._blocking = False
+                clicked_row = i
                 break
+
+        if clicked_row < 0:
+            return
+
+        mods = QtWidgets.QApplication.keyboardModifiers()
+        shift = bool(mods & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        ctrl = bool(mods & QtCore.Qt.KeyboardModifier.ControlModifier)
+
+        if not hasattr(self, "_selection_anchor_row"):
+            self._selection_anchor_row = clicked_row
+
+        if shift:
+            anchor = getattr(self, "_selection_anchor_row", clicked_row)
+            a, b = sorted((anchor, clicked_row))
+
+            self.list.clearSelection()
+            for row in range(a, b + 1):
+                item = self.list.item(row)
+                if item is not None:
+                    item.setSelected(True)
+
+            self.list.setCurrentRow(clicked_row)
+
+        elif ctrl:
+            item = self.list.item(clicked_row)
+            if item is not None:
+                item.setSelected(not item.isSelected())
+
+            self.list.setCurrentRow(clicked_row)
+            self._selection_anchor_row = clicked_row
+
+        else:
+            self.list.clearSelection()
+            item = self.list.item(clicked_row)
+            if item is not None:
+                item.setSelected(True)
+
+            self.list.setCurrentRow(clicked_row)
+            self._selection_anchor_row = clicked_row
+
+        # Reflect clicked segment in the editor and region.
+        s = self.state.segments[clicked_row]
+
+        self._blocking = True
+        self.region.setRegion((s.t_start, s.t_end))
+        self.sel_start.setValue(s.t_start)
+        self.sel_end.setValue(s.t_end)
+        self.lbl_sel_delta.setText(f"(Δ {(s.t_end - s.t_start):.2f} s)")
+        self._blocking = False
+
+        self._reflect_labelbar()
 
     def current_signal(self) -> np.ndarray:
         """
@@ -1871,17 +2286,20 @@ class App(QtWidgets.QMainWindow):
             start_tick += stride_ticks
 
         # apply to state
+        before = self._segments_snapshot()
+        before_selection = self._selected_segment_ids()
+
+        # apply to state
         if replace:
             self.state.segments = new_segments
         else:
             self.state.segments.extend(new_segments)
 
-        # refresh UI and persist
-        self.refresh_segment_list()
-        self.save_json()
+        after_selection = [new_segments[0].id] if new_segments else []
 
-        # select the first of the newly added segments
-        if self.state.segments:
-            idx = len(self.state.segments) - len(new_segments)
-            self.list.setCurrentRow(max(0, idx))
+        self._commit_segments_edit(
+            before,
+            before_selection=before_selection,
+            after_selection=after_selection,
+        )
 
