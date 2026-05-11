@@ -23,10 +23,8 @@ GRAYSCALE_DEBUG = True       # Use grayscale spectrograms for debugging
 
 # Metadata fields for recordings
 METADATA_FIELDS = [
-    "subject_id",
-    "microphone_type",
-    "sample_rate",
-    "location",
+    "environment",
+    "notes",
 ]
 
 # Standard label definitions for lung and heart sounds
