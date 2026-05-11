@@ -1,5 +1,5 @@
 from PySide6 import QtWidgets
-from .config import TIME_SNAP
+from .app_settings import TIME_SNAP
 from typing import Tuple
 
 

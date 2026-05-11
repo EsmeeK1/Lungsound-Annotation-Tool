@@ -22,7 +22,7 @@ def _try_set_pg_option(key: str, value):
     except Exception:
         pass
 
-from .config import DEFAULT_SR, TIME_SNAP, DEBUG_STFT, DYNAMIC_SPECTRO_LEVELS, GRAYSCALE_DEBUG, METADATA_FIELDS, LABEL_SETS, DEFAULT_LABEL_SET, load_prefs, save_prefs, labels_list_to_dict, load_default_locations, UserPrefs
+from .app_settings import DEFAULT_SR, TIME_SNAP, DEBUG_STFT, DYNAMIC_SPECTRO_LEVELS, GRAYSCALE_DEBUG, METADATA_FIELDS, LABEL_SETS, DEFAULT_LABEL_SET, load_prefs, save_prefs, labels_list_to_dict, load_default_locations, UserPrefs
 from .models import Segment, FileState, normalize_subject_id
 from .utils import snap_t, human_relpath, json_sidecar_path, csv_path_for_root, labels_dataset_path, ensure_dir, LABEL_COLORS
 from .audio import bandpass_filter, compute_stft_db, Player
@@ -1790,7 +1790,7 @@ class App(QtWidgets.QMainWindow):
         2) Set the LabelBar labels from either custom or predefined sets.
         3) Refresh location dropdown and reflect toggles for the current segment.
         """
-        from .config import LABEL_SETS, labels_list_to_dict
+        from .app_settings import LABEL_SETS, labels_list_to_dict
 
         # 1) custom handling, make sure labels are loaded
         if name.lower().startswith("custom"):
@@ -2202,7 +2202,7 @@ class App(QtWidgets.QMainWindow):
         if name == "Custom" and self._custom_labels:
             return list(self._custom_labels)
 
-        from .config import LABEL_SETS
+        from .app_settings import LABEL_SETS
         return list(LABEL_SETS.get(name, {}).keys())
 
     def auto_segment_dialog(self):

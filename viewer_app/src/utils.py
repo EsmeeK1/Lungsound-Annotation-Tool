@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from PySide6 import QtGui
 
-from .config import LABELS_JSON_PATH, TIME_SNAP
+from .app_settings import LABELS_JSON_PATH, TIME_SNAP
 
 
 # time helpers
